@@ -25,6 +25,13 @@ pub fn main(args: &[String]) -> Result<()> {
         "train-llr" => crate::evidence::dev_train_llr(rest),
         "detect" => crate::cadence::dev_detect(rest),
         "plan" => crate::plan::dev_plan(rest),
+        "plan-stream" => crate::explicit::dev_plan_stream(rest),
+        "write-explicit" => crate::explicit::dev_write_explicit(rest),
+        "explicit-candidates" => crate::explicit::dev_explicit_candidates(rest),
+        "write-stream" => crate::stream::dev_write_stream(rest),
+        "new-lists" => crate::stream::dev_new_lists(rest),
+        "rebuild-candidates" => crate::rebuild::dev_rebuild_candidates(rest),
+        "write-rebuilt" => crate::rebuild::dev_write_rebuilt(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }

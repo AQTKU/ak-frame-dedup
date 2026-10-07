@@ -1,22 +1,28 @@
 //! Annex-B stream handling: extraction, loading, scope check, display order
 //! and rewriting. Port of `frame_dedup/stream.py`.
 //!
-//! This file has the loading side (`load`, `check_scope`, `input_rate`,
-//! `au_offsets`); the writers are still to be ported.
+//! Loading (`load`, `check_scope`, `input_rate`, `au_offsets`), extraction,
+//! the stream writers (`write_stream`, `write_explicit`) and the header-only
+//! reference-list helpers (`new_lists`, `free_drop_checker`).
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{BufWriter, Write as _};
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 use serde_json::{Map, Value, json};
 
-use crate::bits::{escape, unescape};
+use crate::bits::{escape, set_bits, unescape};
+use crate::explicit::{Entry, HeaderPlan, rewrite_slice};
 use crate::h264hdr::{Picture, Ppss, Pps, SliceHeader, Sps, Spss, Vui, Hrd, iter_nals, parse_stream, patch_sps_timing, sps_frame_rate};
 use crate::mv::dpb_walk;
+use crate::rebuild::{RECOVERY_SEI, first_sc};
 use crate::records::canonical_text;
+use crate::system;
 
 /// The input is outside what this tool can process (Python: `Unsupported`).
 /// Carried inside an `anyhow::Error`; the pipeline downcasts to it for exit code 3.
@@ -128,6 +134,309 @@ pub fn input_rate(spss: &Spss) -> Result<(u64, u64)> {
     match sps_frame_rate(s) {
         Some(fr) => Ok(fr),
         None => Err(unsupported("the SPS carries no VUI timing_info; cannot read the input frame rate")),
+    }
+}
+
+/// Extract the first video track to Annex-B with ffmpeg
+/// (`-c copy -bsf:v h264_mp4toannexb`).
+pub fn extract_annexb(mkv: &Path, out_path: &Path) -> Result<()> {
+    let r = system::command("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(mkv)
+        .args(["-map", "0:v:0", "-c", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "h264"])
+        .arg(out_path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not start ffmpeg: {e}"))?;
+    if !r.status.success() {
+        let err = String::from_utf8_lossy(&r.stderr);
+        let err: String = err.trim().chars().take(400).collect();
+        return Err(unsupported(format!("could not extract an H.264 video stream: {err}")));
+    }
+    Ok(())
+}
+
+/// The decode ranges of the IDR periods (`pics[range]` is period `i`), for
+/// the `periods` argument of the rebuild eligibility checks. Pictures of a
+/// period are contiguous in decode order.
+pub fn period_ranges(pics: &[Picture]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (i, p) in pics.iter().enumerate() {
+        if p.period == out.len() {
+            out.push(i..i + 1);
+        } else {
+            out[p.period].end = i + 1;
+        }
+    }
+    out
+}
+
+const START_CODE: [u8; 4] = [0, 0, 0, 1];
+
+/// (start_code_pos, payload_start, payload_end) for the NALs in a byte range
+/// (Python: `_nals`).
+fn nals(buf: &[u8]) -> Vec<(usize, usize, usize)> {
+    iter_nals(buf)
+        .into_iter()
+        .map(|(s, e)| {
+            let mut sc = s - 3;
+            if sc > 0 && buf[sc - 1] == 0 {
+                sc -= 1;
+            }
+            (sc, s, e)
+        })
+        .collect()
+}
+
+/// Write the non-VCL NALs in front of a picture, with every SPS's VUI timing
+/// patched to `timing` = (num_units_in_tick, time_scale). Returns the number
+/// of SPSs patched (Python: `_write_head`).
+fn write_head<W: std::io::Write>(
+    o: &mut W,
+    head: &[u8],
+    timing: Option<(u32, u32)>,
+    sps_cache: &mut HashMap<Vec<u8>, Vec<u8>>,
+) -> Result<usize> {
+    let Some((num, scale)) = timing else {
+        o.write_all(head)?;
+        return Ok(0);
+    };
+    if head.is_empty() {
+        return Ok(0);
+    }
+    let (mut pos, mut n) = (0, 0);
+    for (_sc, s, e) in nals(head) {
+        if head[s] & 0x1f == 7 {
+            let nal = &head[s..e];
+            if !sps_cache.contains_key(nal) {
+                sps_cache.insert(nal.to_vec(), patch_sps_timing(nal, num, scale)?);
+            }
+            o.write_all(&head[pos..s])?;
+            o.write_all(&sps_cache[nal])?;
+            pos = e;
+            n += 1;
+        }
+    }
+    o.write_all(&head[pos..])?;
+    Ok(n)
+}
+
+fn map_input(path: &Path) -> Result<Mmap> {
+    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    Ok(unsafe { Mmap::map(&file)? })
+}
+
+fn create_output(path: &Path) -> Result<BufWriter<File>> {
+    let f = File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+    Ok(BufWriter::with_capacity(1 << 22, f))
+}
+
+/// Write the stream planned by `explicit::plan_stream`: pictures not in
+/// `entries` are dropped (their non-VCL NALs ride along with the next
+/// picture), headers that changed are rewritten, and a demoted IDR (anchor
+/// rebuild "I2") is written in K's slot behind K's and its own non-VCL NALs
+/// and a recovery point SEI. `timing` = (num_units_in_tick, time_scale).
+/// Returns (rewritten slices, SPSs patched).
+#[allow(clippy::too_many_arguments)]
+pub fn write_explicit(
+    es_path: &Path,
+    pics: &[Picture],
+    spss: &Spss,
+    ppss: &Ppss,
+    out_path: &Path,
+    entries: &[Entry],
+    hdrs: &[HeaderPlan],
+    timing: Option<(u32, u32)>,
+) -> Result<(usize, usize)> {
+    const NONE: usize = usize::MAX;
+    let mut at = vec![NONE; pics.len()]; // original dec -> index of its entry
+    let mut i2_at: HashMap<usize, usize> = HashMap::new(); // K's dec -> entry of I2
+    let mut moved = vec![false; pics.len()];
+    for (i, e) in entries.iter().enumerate() {
+        if e.demote {
+            let k = e.as_.ok_or_else(|| anyhow::anyhow!("KeyError: 'as'"))?;
+            i2_at.insert(k, i);
+            moved[e.pic] = true;
+        } else {
+            at[e.pic] = i;
+        }
+    }
+    let (mut n_rw, mut n_sps) = (0, 0);
+    let mut sps_cache = HashMap::new();
+    let mm = map_input(es_path)?;
+    let mut o = create_output(out_path)?;
+    for p in pics {
+        let sl = &p.slices[0];
+        let first = first_sc(&mm, sl);
+        let end = sl.offset + sl.size;
+        if moved[p.dec] {
+            // written in K's slot
+            o.write_all(&mm[end..p.au_end])?;
+            continue;
+        }
+        n_sps += write_head(&mut o, &mm[p.au_start..first], timing, &mut sps_cache)?;
+        if let Some(&i) = i2_at.get(&p.dec) {
+            let dp = &pics[entries[i].pic];
+            let dsl = &dp.slices[0];
+            n_sps += write_head(&mut o, &mm[dp.au_start..first_sc(&mm, dsl)], timing, &mut sps_cache)?;
+            o.write_all(&START_CODE)?;
+            o.write_all(&RECOVERY_SEI)?;
+            o.write_all(&START_CODE)?;
+            o.write_all(&rewrite_slice(&mm[dsl.offset..dsl.offset + dsl.size], dsl, spss, ppss, &hdrs[i])?)?;
+            n_rw += 1;
+            o.write_all(&mm[end..p.au_end])?;
+            continue;
+        }
+        if at[p.dec] == NONE {
+            // dropped
+            o.write_all(&mm[end..p.au_end])?;
+            continue;
+        }
+        let h = &hdrs[at[p.dec]];
+        if h.same {
+            o.write_all(&mm[first..end])?;
+        } else {
+            o.write_all(&START_CODE)?;
+            o.write_all(&rewrite_slice(&mm[sl.offset..end], sl, spss, ppss, h)?)?;
+            n_rw += 1;
+        }
+        o.write_all(&mm[end..p.au_end])?;
+    }
+    o.flush()?;
+    Ok((n_rw, n_sps))
+}
+
+/// Options of [`write_stream`].
+#[derive(Default)]
+pub struct WriteOpts<'a> {
+    /// Decode indices to remove.
+    pub drop: HashSet<usize>,
+    /// Replacement NAL bytes (header byte first) by decode index.
+    pub repl: Option<&'a HashMap<usize, Vec<u8>>>,
+    /// (num_units_in_tick, time_scale) for every SPS's VUI.
+    pub timing: Option<(u32, u32)>,
+    /// Explicit mode: header plans by decode index, rewritten instead of
+    /// renumbering (needs `ppss`).
+    pub hdrs: Option<&'a HashMap<usize, HeaderPlan>>,
+    pub ppss: Option<&'a Ppss>,
+}
+
+/// Write a copy of the stream with the pictures in `opts.drop` removed,
+/// frame_num renumbered after dropped reference pictures (up to the next
+/// IDR), NALs in `opts.repl` substituted, and every SPS's VUI timing set to
+/// `opts.timing`. With `opts.hdrs` the slice headers named there are
+/// rewritten instead of renumbered. Returns (rewritten slices, SPSs patched).
+pub fn write_stream(es_path: &Path, pics: &[Picture], spss: &Spss, out_path: &Path, opts: &WriteOpts) -> Result<(usize, usize)> {
+    let sps = spss.get(&0).ok_or_else(|| anyhow::anyhow!("KeyError: 0 (no SPS with id 0)"))?;
+    let log2_fn = sps.log2_max_frame_num;
+    let max_fn = 1i64 << log2_fn;
+    let (mut n_renum, mut n_sps) = (0, 0);
+    let mut sps_cache = HashMap::new();
+    let mm = map_input(es_path)?;
+    let mut o = create_output(out_path)?;
+    let mut shift: i64 = 0;
+    for p in pics {
+        if p.idr {
+            shift = 0;
+        }
+        let sl = &p.slices[0];
+        let first = first_sc(&mm, sl);
+        // non-VCL NALs in front of the picture (SPS/PPS/AUD/SEI) ride along
+        n_sps += write_head(&mut o, &mm[p.au_start..first], opts.timing, &mut sps_cache)?;
+        let end = sl.offset + sl.size;
+        if opts.drop.contains(&p.dec) {
+            if p.ref_idc != 0 {
+                shift += 1;
+            }
+            o.write_all(&mm[end..p.au_end])?; // trailing zero bytes, if any
+            continue;
+        }
+        let mut nal: std::borrow::Cow<[u8]>;
+        if let Some(r) = opts.repl.and_then(|r| r.get(&p.dec)) {
+            o.write_all(&START_CODE)?;
+            nal = std::borrow::Cow::Borrowed(&r[..]);
+        } else {
+            o.write_all(&mm[first..sl.offset])?;
+            nal = std::borrow::Cow::Borrowed(&mm[sl.offset..end]);
+        }
+        if let Some(hdrs) = opts.hdrs {
+            if let Some(h) = hdrs.get(&p.dec) {
+                let ppss = opts.ppss.ok_or_else(|| anyhow::anyhow!("write_stream: hdrs needs ppss"))?;
+                nal = std::borrow::Cow::Owned(rewrite_slice(&nal, sl, spss, ppss, h)?);
+                n_renum += 1;
+            }
+        } else if shift != 0 {
+            let mut rbsp = unescape(&nal[1..]);
+            set_bits(&mut rbsp, sl.frame_num_bit, log2_fn, (sl.frame_num as i64 - shift).rem_euclid(max_fn) as u64);
+            let mut v = vec![nal[0]];
+            v.extend_from_slice(&escape(&rbsp));
+            nal = std::borrow::Cow::Owned(v);
+            n_renum += 1;
+        }
+        o.write_all(&nal)?;
+        o.write_all(&mm[end..p.au_end])?;
+    }
+    o.flush()?;
+    Ok((n_renum, n_sps))
+}
+
+/// For the stream with `drop` removed: the original decode indices, in new
+/// decode order.
+pub fn remap_after_drop(pics: &[Picture], drop: &HashSet<usize>) -> Vec<usize> {
+    pics.iter().map(|p| p.dec).filter(|d| !drop.contains(d)).collect()
+}
+
+/// Header-only reference lists of the deduplicated stream, expressed as
+/// original decode indices: `{orig dec: lists}` for the kept pictures.
+/// `pics` is a run of pictures of the original stream (decode ids need not
+/// start at 0).
+pub fn new_lists(spss: &Spss, pics: &[Picture], drop: &HashSet<usize>) -> Result<HashMap<usize, [Vec<usize>; 2]>> {
+    let sps = spss.get(&0).ok_or_else(|| anyhow::anyhow!("KeyError: 0 (no SPS with id 0)"))?;
+    let max_fn = 1i64 << sps.log2_max_frame_num;
+    let mut shadow: Vec<Picture> = Vec::with_capacity(pics.len());
+    let mut orig: Vec<usize> = Vec::with_capacity(pics.len());
+    let mut shift: i64 = 0;
+    for p in pics {
+        if p.idr {
+            shift = 0;
+        }
+        if drop.contains(&p.dec) {
+            if p.ref_idc != 0 {
+                shift += 1;
+            }
+            continue;
+        }
+        let mut sl = p.slices[0].clone();
+        sl.frame_num = (p.slices[0].frame_num as i64 - shift).rem_euclid(max_fn) as u32;
+        shadow.push(Picture { slices: vec![sl], idr: p.idr, ref_idc: p.ref_idc, ..Default::default() });
+        orig.push(p.dec);
+    }
+    dpb_walk(spss, &mut shadow)?;
+    let by_dec: HashMap<usize, &Picture> = pics.iter().map(|p| (p.dec, p)).collect();
+    let mut out = HashMap::with_capacity(shadow.len());
+    for (i, q) in shadow.iter().enumerate() {
+        let lists = [0, 1].map(|l| q.lists[l].iter().map(|&j| orig[j]).collect::<Vec<_>>());
+        out.insert(orig[i], lists);
+        if q.poc != by_dec[&orig[i]].poc {
+            bail!("AssertionError: POC of picture {} changed", orig[i]);
+        }
+    }
+    Ok(out)
+}
+
+/// Returns `free(dec)`: true when removing picture `dec` (a reference
+/// picture) changes no other picture's reference lists in its IDR period,
+/// i.e. nothing reads it and the sliding window stays equivalent. Such a drop
+/// is bit-exact for every other frame, like a non-reference drop.
+pub fn free_drop_checker<'a>(spss: &'a Spss, pics: &'a [Picture]) -> impl Fn(usize) -> Result<bool> + Sync + 'a {
+    let periods = period_ranges(pics);
+    move |dec| {
+        let p = &pics[dec];
+        if p.idr {
+            return Ok(false);
+        }
+        let per = &pics[periods[p.period].clone()];
+        let nl = new_lists(spss, per, &HashSet::from([dec]))?;
+        Ok(per.iter().filter(|q| q.dec != dec).all(|q| nl[&q.dec] == q.lists))
     }
 }
 
@@ -358,6 +667,96 @@ pub fn dev_headers(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `dev write-stream <es> <scenario.json> <out.h264> [--hdrs]`: `write_stream`
+/// with the scenario's drops, timing and replacement NALs (the NAL bytes of
+/// another picture); `--hdrs` also rewrites the headers from an explicit-mode
+/// plan of the same drops (no rebuilds). Prints the counts and size as JSON.
+pub fn dev_write_stream(args: &[String]) -> Result<()> {
+    let [es, scen, out, rest @ ..] = args else {
+        bail!("usage: frame-dedup dev write-stream <file.h264> <scenario.json> <out.h264> [--hdrs]");
+    };
+    let use_hdrs = rest.iter().any(|a| a == "--hdrs");
+    let (spss, ppss, pics) = load(Path::new(es))?;
+    let sc = crate::explicit::read_scenario(scen)?;
+    let mm = map_input(Path::new(es))?;
+    let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
+    for &(d, src) in &sc.repl {
+        let s = &pics[src].slices[0];
+        repl.insert(d, mm[s.offset..s.offset + s.size].to_vec());
+    }
+    let hdrs_map: Option<HashMap<usize, HeaderPlan>> = if use_hdrs {
+        let (entries, hdrs) = crate::explicit::plan_stream(&spss, &pics, &sc.drop, &sc.sigma, &[])?;
+        Some(entries.iter().zip(hdrs).map(|(e, h)| (e.pic, h)).collect())
+    } else {
+        None
+    };
+    let opts = WriteOpts {
+        drop: sc.drop.clone(),
+        repl: if repl.is_empty() { None } else { Some(&repl) },
+        timing: sc.timing,
+        hdrs: hdrs_map.as_ref(),
+        ppss: Some(&ppss),
+    };
+    let (n_renum, n_sps) = write_stream(Path::new(es), &pics, &spss, Path::new(out), &opts)?;
+    let size = std::fs::metadata(out)?.len();
+    println!("{}", json!({"n_renum": n_renum, "n_sps": n_sps, "size": size}));
+    Ok(())
+}
+
+/// An error as a dump string; assertion failures carry no comparable message
+/// in Python, so only their name is dumped (oracle: `_err`).
+fn err_text(e: &anyhow::Error) -> String {
+    let s = e.to_string();
+    if s.starts_with("AssertionError") { "AssertionError".into() } else { s }
+}
+
+fn lists_json(l: &[Vec<usize>; 2]) -> Value {
+    json!([l[0], l[1]])
+}
+
+/// `dev new-lists <es> [scenario.json]`: for every picture the verdict of
+/// `free_drop_checker` and a digest of `new_lists` for that single drop (or
+/// the error), then, with a scenario, `new_lists` for its drop set in full.
+pub fn dev_new_lists(args: &[String]) -> Result<()> {
+    let (es, scen) = match args {
+        [es] => (es, None),
+        [es, s] => (es, Some(s)),
+        _ => bail!("usage: frame-dedup dev new-lists <file.h264> [scenario.json]"),
+    };
+    let (spss, _ppss, pics) = load(Path::new(es))?;
+    let free = free_drop_checker(&spss, &pics);
+    for p in &pics {
+        let f = match free(p.dec) {
+            Ok(b) => json!(b),
+            Err(e) => json!({"error": err_text(&e)}),
+        };
+        let nl = match new_lists(&spss, &pics, &HashSet::from([p.dec])) {
+            Ok(m) => {
+                let mut v: Vec<(usize, Value)> = m.iter().map(|(&d, l)| (d, lists_json(l))).collect();
+                v.sort_by_key(|x| x.0);
+                let text = canonical_text(&Value::Array(v.into_iter().map(|(d, l)| json!([d, l])).collect()));
+                json!([text.len(), crc32(text.as_bytes())])
+            }
+            Err(e) => json!({"error": err_text(&e)}),
+        };
+        println!("{}", canonical_text(&json!({"dec": p.dec, "free": f, "nl": nl})));
+    }
+    if let Some(s) = scen {
+        let sc = crate::explicit::read_scenario(s)?;
+        match new_lists(&spss, &pics, &sc.drop) {
+            Ok(m) => {
+                let mut v: Vec<(usize, Value)> = m.iter().map(|(&d, l)| (d, lists_json(l))).collect();
+                v.sort_by_key(|x| x.0);
+                for (d, l) in v {
+                    println!("{}", canonical_text(&json!({"dec": d, "lists": l})));
+                }
+            }
+            Err(e) => println!("{}", canonical_text(&json!({"error": err_text(&e)}))),
+        }
+    }
+    Ok(())
+}
+
 /// zlib.crc32
 pub fn crc32(data: &[u8]) -> u32 {
     let mut table = [0u32; 256];
@@ -450,6 +849,55 @@ mod tests {
         assert_eq!(e.to_string(), "nope");
         let wrapped = e.context("while loading");
         assert!(wrapped.downcast_ref::<Unsupported>().is_some());
+    }
+
+    #[test]
+    fn nals_and_head_patching() {
+        // AUD with a 4-byte start code, then an SPS-less filler NAL with a 3-byte one
+        let buf = [0, 0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x06, 0x01, 0x80, 0, 0];
+        let n = nals(&buf);
+        assert_eq!(n, vec![(0, 4, 6), (6, 9, 12)]);
+        // no timing: written as is
+        let mut out = Vec::new();
+        let mut cache = HashMap::new();
+        assert_eq!(write_head(&mut out, &buf, None, &mut cache).unwrap(), 0);
+        assert_eq!(out, buf);
+        // timing, no SPS in the head: also as is
+        let mut out = Vec::new();
+        assert_eq!(write_head(&mut out, &buf, Some((1001, 48000)), &mut cache).unwrap(), 0);
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn period_ranges_are_contiguous() {
+        let mk = |period| Picture { period, ..Default::default() };
+        let pics = [mk(0), mk(0), mk(0), mk(1), mk(2), mk(2)];
+        assert_eq!(period_ranges(&pics), vec![0..3, 3..4, 4..6]);
+    }
+
+    const CLIPS: &str = r"C:\Users\aquat\Documents\GitHub\ak-frame-dedup\work\port\clips";
+
+    /// Dropping nothing and patching no timing gives back the clip; dropping a
+    /// non-reference picture removes exactly its NAL. Skipped without the clip.
+    #[test]
+    fn write_stream_on_a_clip() {
+        let path = Path::new(CLIPS).join("sample.h264");
+        if !path.exists() {
+            return;
+        }
+        let (spss, _ppss, pics) = load(&path).unwrap();
+        let out = std::env::temp_dir().join("frame_dedup_write_stream_test.h264");
+        let n = write_stream(&path, &pics, &spss, &out, &WriteOpts::default()).unwrap();
+        assert_eq!(n, (0, 0));
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&path).unwrap());
+        let victim = pics.iter().find(|p| p.ref_idc == 0).unwrap();
+        let opts = WriteOpts { drop: HashSet::from([victim.dec]), ..Default::default() };
+        write_stream(&path, &pics, &spss, &out, &opts).unwrap();
+        let sl = &victim.slices[0];
+        let full = std::fs::metadata(&path).unwrap().len() as usize;
+        let cut = std::fs::metadata(&out).unwrap().len() as usize;
+        assert_eq!(full - cut, sl.size + (sl.offset - first_sc(&std::fs::read(&path).unwrap(), sl)));
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
