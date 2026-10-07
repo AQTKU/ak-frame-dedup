@@ -24,6 +24,7 @@ pub fn main(args: &[String]) -> Result<()> {
         "features" => crate::evidence::dev_features(rest),
         "features-raw" => crate::evidence::dev_features_raw(rest),
         "train-llr" => crate::evidence::dev_train_llr(rest),
+        "train-model" => crate::evidence::dev_train_model(rest),
         "detect" => crate::cadence::dev_detect(rest),
         "plan" => crate::plan::dev_plan(rest),
         "plan-stream" => crate::explicit::dev_plan_stream(rest),

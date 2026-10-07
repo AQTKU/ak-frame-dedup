@@ -504,6 +504,83 @@ pub fn dev_train_llr(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `dev train-model <labelled.mkv> [--work DIR] [--out FILE]`: retrain the
+/// likelihood tables shipped as `cadence_model.json` (Python:
+/// `tools/train_model.py`). Labels come from sample.mkv, whose duplicates were
+/// retimed 1 ms after their twin: in PTS order, frame i is a repeat when
+/// pts[i] - pts[i-1] <= 5 ms (PTS order equals display order for that file).
+pub fn dev_train_model(args: &[String]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Table {
+        bins: Vec<f64>,
+        llr: Vec<f64>,
+    }
+    #[derive(Serialize)]
+    struct Tables {
+        mad: Table,
+        bmax: Table,
+    }
+    #[derive(Serialize)]
+    struct ModelFile {
+        trained_on: String,
+        n_frames: usize,
+        n_repeats: usize,
+        features: Tables,
+    }
+    let mut it = args.iter();
+    let (mut mkv, mut work, mut out) = (None, "work/train".to_string(), "src/cadence_model.json".to_string());
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--work" => work = it.next().context("--work needs a value")?.clone(),
+            "--out" => out = it.next().context("--out needs a value")?.clone(),
+            _ => mkv = Some(a.clone()),
+        }
+    }
+    let Some(mkv) = mkv else { bail!("usage: dev train-model <labelled.mkv> [--work DIR] [--out FILE]") };
+    std::fs::create_dir_all(&work)?;
+    let es = std::path::Path::new(&work).join("train.h264");
+    let feat_path = std::path::Path::new(&work).join("train_feat.json");
+    let feat: Features = if feat_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&feat_path)?)?
+    } else {
+        crate::stream::extract_annexb(std::path::Path::new(&mkv), &es)?;
+        let f = proxy_features(&es.to_string_lossy(), 8)?;
+        std::fs::write(&feat_path, serde_json::to_string(&f)?)?;
+        f
+    };
+    let o = crate::system::command("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", &mkv])
+        .output()
+        .context("cannot run ffprobe")?;
+    let mut pts: Vec<f64> = String::from_utf8_lossy(&o.stdout)
+        .split_whitespace()
+        .filter(|x| *x != "N/A")
+        .map(|x| x.parse::<f64>())
+        .collect::<Result<_, _>>()?;
+    pts.sort_by(f64::total_cmp);
+    let labels: Vec<usize> = (1..pts.len()).filter(|&i| pts[i] - pts[i - 1] <= 0.005).collect();
+    if pts.len() != feat.mad.len() {
+        bail!("{} packets but {} proxy frames", pts.len(), feat.mad.len());
+    }
+    let bins = default_bins();
+    let table = |x: &[f64]| {
+        let (b, l) = train_llr(&rel_diff(x), &labels, &bins);
+        Table { bins: b.iter().map(|&v| np::round(v, 6)).collect(), llr: l.iter().map(|&v| np::round(v, 6)).collect() }
+    };
+    let model = ModelFile {
+        trained_on: std::path::Path::new(&mkv).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or(mkv.clone()),
+        n_frames: pts.len(),
+        n_repeats: labels.len(),
+        features: Tables { mad: table(&feat.mad), bmax: table(&feat.bmax) },
+    };
+    let mut buf = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    serde::Serialize::serialize(&model, &mut serde_json::Serializer::with_formatter(&mut buf, fmt))?;
+    std::fs::write(&out, buf)?;
+    println!("{} frames, {} labelled repeats -> {out}", pts.len(), labels.len());
+    Ok(())
+}
+
 /// `dev features <file.h264> [threads]`: the proxy features as JSON.
 pub fn dev_features(args: &[String]) -> Result<()> {
     let Some(path) = args.first() else { bail!("usage: dev features <file.h264> [threads]") };
