@@ -32,6 +32,9 @@ pub fn main(args: &[String]) -> Result<()> {
         "new-lists" => crate::stream::dev_new_lists(rest),
         "rebuild-candidates" => crate::rebuild::dev_rebuild_candidates(rest),
         "write-rebuilt" => crate::rebuild::dev_write_rebuilt(rest),
+        "motion" => crate::reexpress::dev_motion(rest),
+        "reexpress" => crate::reexpress::dev_reexpress(rest),
+        "patch-replay" => crate::patch::dev_patch_replay(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }

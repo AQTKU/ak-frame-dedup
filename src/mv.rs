@@ -5,10 +5,10 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::h264hdr::{Picture, SliceType, Spss};
-use crate::records::Mb;
+use crate::records::{B_SUB, B_TYPES, Mb, Mvds, P_SUB, Part, Pred, SubShape};
 
 /// A short-term reference picture as the list initialisation sees it
 /// (Python: a dict with 'dec', 'frame_num' and 'poc').
@@ -260,23 +260,568 @@ impl Motion {
     pub fn idx(&self, gx: usize, gy: usize) -> usize {
         gy * self.w4 + gx
     }
+
+    /// Canonical digests for the oracle comparison (`dev motion`, port/oracle.py
+    /// `motion`): the SHA-256 of the little-endian packed arrays, row-major
+    /// by 4x4 block, and the same over their concatenation. Fields: intra,
+    /// direct, refidx (L0 then L1), mv (L0 then L1; x, y as i16), refpic
+    /// (L0 then L1; i32, -1 where Python has None). Returns (whole, [intra,
+    /// direct, refidx, mv, refpic]).
+    pub fn canonical_digests(&self) -> (String, [String; 5]) {
+        use crate::picture::{hex, sha256};
+        let mut bufs: [Vec<u8>; 5] = Default::default();
+        bufs[0] = self.intra.clone();
+        bufs[1] = self.direct.clone();
+        for l in 0..2 {
+            bufs[2].extend(self.refidx[l].iter().map(|&v| v as u8));
+            for v in &self.mv[l] {
+                bufs[3].extend_from_slice(&v[0].to_le_bytes());
+                bufs[3].extend_from_slice(&v[1].to_le_bytes());
+            }
+            for v in &self.refpic[l] {
+                bufs[4].extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let all: Vec<u8> = bufs.iter().flatten().copied().collect();
+        (hex(&sha256(&all)), std::array::from_fn(|i| hex(&sha256(&bufs[i]))))
+    }
 }
 
-/// Reconstruct motion for a parsed picture (Python `derive_motion`).
-/// `pics` is indexed by decode index and supplies POCs; `col` is the motion
-/// of RefPicList1[0] (needed for B pictures with direct blocks). With
-/// `target`, explicit partitions take their mvs from the target field and
-/// their mvds are solved and written into `mbs`.
-pub fn derive_motion(
-    _pic: &Picture,
-    _mbs: &mut [Mb],
-    _mb_w: usize,
-    _mb_h: usize,
-    _pics: &[Picture],
-    _col: Option<&Motion>,
-    _target: Option<&Motion>,
-) -> Motion {
-    todo!("port h264mv.derive_motion")
+// ===========================================================================
+// derive_motion
+// ===========================================================================
+
+/// Reference index and mv of a neighbouring 4x4 block (Python `(ref, (x, y))`).
+type Nb = (i32, [i32; 2]);
+/// An unavailable neighbour: Python's `z = (-1, (0, 0))`.
+const NB_NONE: Nb = (-1, [0, 0]);
+
+fn median(a: i32, b: i32, c: i32) -> i32 {
+    a.min(b).max(a.max(b).min(c))
+}
+
+/// Partition rectangles (x, y, w, h in 4x4 units, relative to the MB) in
+/// Python's partition order; the first block of each is `mb_parts(part)[p][0]`.
+fn mb_rects(part: Part) -> &'static [(i32, i32, i32, i32)] {
+    match part {
+        Part::P16x16 => &[(0, 0, 4, 4)],
+        Part::P16x8 => &[(0, 0, 4, 2), (0, 2, 4, 2)],
+        Part::P8x16 => &[(0, 0, 2, 4), (2, 0, 2, 4)],
+        _ => unreachable!("mb_rects({part:?})"),
+    }
+}
+
+/// Sub-partition rectangles relative to the 8x8 quadrant (`sub_parts(shape)`).
+fn sub_rects(shape: SubShape) -> &'static [(i32, i32, i32, i32)] {
+    match shape {
+        SubShape::S8x8 => &[(0, 0, 2, 2)],
+        SubShape::S8x4 => &[(0, 0, 2, 1), (0, 1, 2, 1)],
+        SubShape::S4x8 => &[(0, 0, 1, 2), (1, 0, 1, 2)],
+        SubShape::S4x4 => &[(0, 0, 1, 1), (1, 0, 1, 1), (0, 1, 1, 1), (1, 1, 1, 1)],
+        SubShape::Direct => unreachable!("sub_rects of a direct sub-macroblock"),
+    }
+}
+
+/// Bit mask over the 16 4x4 blocks of an MB (bit `ly * 4 + lx`) for a rectangle.
+fn rect_mask(lx: i32, ly: i32, w: i32, h: i32) -> u16 {
+    let mut m = 0u16;
+    for y in ly..ly + h {
+        for x in lx..lx + w {
+            m |= 1 << (y * 4 + x);
+        }
+    }
+    m
+}
+
+/// Access to the macroblock records for `derive`: read-only, or read-write
+/// when target mode has to write solved mvds.
+trait Recs {
+    fn recs(&self) -> &[Mb];
+    fn recs_mut(&mut self) -> Option<&mut [Mb]>;
+}
+
+impl Recs for &[Mb] {
+    fn recs(&self) -> &[Mb] {
+        self
+    }
+    fn recs_mut(&mut self) -> Option<&mut [Mb]> {
+        None
+    }
+}
+
+impl Recs for &mut [Mb] {
+    fn recs(&self) -> &[Mb] {
+        self
+    }
+    fn recs_mut(&mut self) -> Option<&mut [Mb]> {
+        Some(self)
+    }
+}
+
+struct Derive<'a> {
+    m: Motion,
+    w4: i32,
+    h4: i32,
+    pic: &'a Picture,
+    pics: &'a [Picture],
+    col: Option<&'a Motion>,
+    /// The MB being derived.
+    cmx: i32,
+    cmy: i32,
+    /// 4x4 blocks of the current MB already assigned (Python's `done` set).
+    done: u16,
+}
+
+impl<'a> Derive<'a> {
+    /// Python `avail`: inside the picture and already decoded.
+    #[inline]
+    fn avail(&self, gx: i32, gy: i32) -> bool {
+        if gx < 0 || gy < 0 || gx >= self.w4 || gy >= self.h4 {
+            return false;
+        }
+        let (mx, my) = (gx >> 2, gy >> 2);
+        if mx == self.cmx && my == self.cmy {
+            return self.done >> ((gy & 3) * 4 + (gx & 3)) & 1 != 0;
+        }
+        my < self.cmy || (my == self.cmy && mx < self.cmx)
+    }
+
+    #[inline]
+    fn nbr(&self, gx: i32, gy: i32, lst: usize) -> Option<Nb> {
+        if !self.avail(gx, gy) {
+            return None;
+        }
+        let i = (gy * self.w4 + gx) as usize;
+        let mv = self.m.mv[lst][i];
+        Some((self.m.refidx[lst][i] as i32, [mv[0] as i32, mv[1] as i32]))
+    }
+
+    /// A, B and C (or D) of the partition at (gx, gy), `w` blocks wide.
+    #[inline]
+    fn neighbours(&self, gx: i32, gy: i32, w: i32, lst: usize) -> (Nb, Nb, Nb) {
+        let a = self.nbr(gx - 1, gy, lst);
+        let mut b = self.nbr(gx, gy - 1, lst);
+        let mut c = self.nbr(gx + w, gy - 1, lst);
+        if c.is_none() {
+            c = self.nbr(gx - 1, gy - 1, lst);
+        }
+        if b.is_none() && c.is_none() && a.is_some() {
+            b = a;
+            c = a;
+        }
+        (a.unwrap_or(NB_NONE), b.unwrap_or(NB_NONE), c.unwrap_or(NB_NONE))
+    }
+
+    /// Motion vector prediction (8.4.1.3) with the 16x8 / 8x16 directional rules.
+    fn mvp(&self, gx: i32, gy: i32, w: i32, lst: usize, rf: i32, shape: Option<Part>, part: usize) -> [i32; 2] {
+        let (a, b, c) = self.neighbours(gx, gy, w, lst);
+        match shape {
+            Some(Part::P16x8) => {
+                if part == 0 && b.0 == rf {
+                    return b.1;
+                }
+                if part == 1 && a.0 == rf {
+                    return a.1;
+                }
+            }
+            Some(Part::P8x16) => {
+                if part == 0 && a.0 == rf {
+                    return a.1;
+                }
+                if part == 1 && c.0 == rf {
+                    return c.1;
+                }
+            }
+            _ => {}
+        }
+        let n_match = (a.0 == rf) as u8 + (b.0 == rf) as u8 + (c.0 == rf) as u8;
+        if n_match == 1 {
+            return if a.0 == rf {
+                a.1
+            } else if b.0 == rf {
+                b.1
+            } else {
+                c.1
+            };
+        }
+        [median(a.1[0], b.1[0], c.1[0]), median(a.1[1], b.1[1], c.1[1])]
+    }
+
+    /// Assign a rectangle of 4x4 blocks (global coordinates) for one list.
+    #[inline]
+    fn setblk(&mut self, gx: i32, gy: i32, w: i32, h: i32, lst: usize, rf: i32, mv: [i32; 2], direct: u8) -> Result<()> {
+        let refpic = if rf >= 0 {
+            match self.pic.lists[lst].get(rf as usize) {
+                Some(&p) => p as i32,
+                None => bail!("list index out of range"),
+            }
+        } else {
+            -1
+        };
+        let mv16 = [mv[0] as i16, mv[1] as i16];
+        for y in gy..gy + h {
+            let row = (y * self.w4) as usize;
+            for x in gx..gx + w {
+                let i = row + x as usize;
+                self.m.refidx[lst][i] = rf as i8;
+                self.m.mv[lst][i] = mv16;
+                self.m.refpic[lst][i] = refpic;
+                self.m.direct[i] = direct;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a rectangle (global coordinates inside the current MB) as assigned.
+    #[inline]
+    fn mark(&mut self, gx: i32, gy: i32, w: i32, h: i32) {
+        self.done |= rect_mask(gx - self.cmx * 4, gy - self.cmy * 4, w, h);
+    }
+
+    fn col_motion(&self) -> Result<&'a Motion> {
+        match self.col {
+            Some(c) => Ok(c),
+            None => bail!("AttributeError: 'NoneType' object has no attribute 'intra' (co-located motion missing)"),
+        }
+    }
+
+    /// Temporal direct for one 8x8 quadrant (direct_8x8_inference).
+    fn temporal_direct(&mut self, i8: i32) -> Result<()> {
+        let cm = self.col_motion()?;
+        let pic = self.pic;
+        let lists = &pic.lists;
+        let Some(&col_dec) = lists[1].first() else { bail!("list index out of range") };
+        let (ox, oy) = (self.cmx * 4 + (i8 % 2) * 2, self.cmy * 4 + (i8 / 2) * 2);
+        // corner 4x4 of the co-located MB for this quadrant
+        let cx = self.cmx * 4 + if i8 % 2 == 1 { 3 } else { 0 };
+        let cy = self.cmy * 4 + if i8 / 2 == 1 { 3 } else { 0 };
+        let ci = (cy * self.w4 + cx) as usize;
+        let (mvcol, refcol): ([i32; 2], i32) = if cm.intra[ci] != 0 {
+            ([0, 0], -1)
+        } else if cm.refidx[0][ci] >= 0 {
+            let v = cm.mv[0][ci];
+            ([v[0] as i32, v[1] as i32], cm.refpic[0][ci])
+        } else {
+            let v = cm.mv[1][ci];
+            ([v[0] as i32, v[1] as i32], cm.refpic[1][ci])
+        };
+        let ref0 = if refcol < 0 {
+            0
+        } else {
+            match lists[0].iter().position(|&x| x as i32 == refcol) {
+                Some(p) => p,
+                None => bail!("ValueError: {refcol} is not in list"),
+            }
+        };
+        let Some(&p0) = lists[0].get(ref0) else { bail!("list index out of range") };
+        let poc0 = self.pics[p0].poc;
+        let poc1 = self.pics[col_dec].poc;
+        let tb = (self.pic.poc - poc0).clamp(-128, 127);
+        let td = (poc1 - poc0).clamp(-128, 127);
+        let (mv0, mv1);
+        if td == 0 {
+            mv0 = mvcol;
+            mv1 = [0, 0];
+        } else {
+            // C integer division (truncates toward zero)
+            let tx = (16384 + td.abs() / 2) / td;
+            let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+            mv0 = [(dsf * mvcol[0] + 128) >> 8, (dsf * mvcol[1] + 128) >> 8];
+            mv1 = [mv0[0] - mvcol[0], mv0[1] - mvcol[1]];
+        }
+        self.setblk(ox, oy, 2, 2, 0, ref0 as i32, mv0, 1)?;
+        self.setblk(ox, oy, 2, 2, 1, 0, mv1, 1)?;
+        self.mark(ox, oy, 2, 2);
+        Ok(())
+    }
+
+    /// MB-level reference indices and mv predictors of spatial direct
+    /// (8.4.1.2.2): MinPositive over the A / B / C(or D) neighbours of the
+    /// whole MB.
+    fn spatial_pred(&self) -> [Nb; 2] {
+        let (x0, y0) = (self.cmx * 4, self.cmy * 4);
+        let mut out = [NB_NONE; 2];
+        for lst in 0..2 {
+            let a = self.nbr(x0 - 1, y0, lst).unwrap_or(NB_NONE);
+            let b = self.nbr(x0, y0 - 1, lst).unwrap_or(NB_NONE);
+            let mut c = self.nbr(x0 + 4, y0 - 1, lst);
+            if c.is_none() {
+                c = self.nbr(x0 - 1, y0 - 1, lst);
+            }
+            let c = c.unwrap_or(NB_NONE);
+            let mut min_ref = i32::MAX;
+            for n in [a, b, c] {
+                if n.0 >= 0 && n.0 < min_ref {
+                    min_ref = n.0;
+                }
+            }
+            if min_ref == i32::MAX {
+                out[lst] = NB_NONE;
+                continue;
+            }
+            let n_match = (a.0 == min_ref) as u8 + (b.0 == min_ref) as u8 + (c.0 == min_ref) as u8;
+            let mv = if n_match > 1 {
+                [median(a.1[0], b.1[0], c.1[0]), median(a.1[1], b.1[1], c.1[1])]
+            } else if a.0 == min_ref {
+                a.1
+            } else if b.0 == min_ref {
+                b.1
+            } else {
+                c.1
+            };
+            out[lst] = (min_ref, mv);
+        }
+        if out[0].0 < 0 && out[1].0 < 0 {
+            out = [(0, [0, 0]), (0, [0, 0])];
+        }
+        out
+    }
+
+    /// Spatial direct for one 8x8 quadrant (direct_8x8_inference): the
+    /// MB-level prediction, with zero mvs where the co-located block is
+    /// (nearly) still and uses reference index 0.
+    fn spatial_direct(&mut self, i8: i32, sp: &[Nb; 2]) -> Result<()> {
+        let cm = self.col_motion()?;
+        let (ox, oy) = (self.cmx * 4 + (i8 % 2) * 2, self.cmy * 4 + (i8 / 2) * 2);
+        let cx = self.cmx * 4 + if i8 % 2 == 1 { 3 } else { 0 };
+        let cy = self.cmy * 4 + if i8 / 2 == 1 { 3 } else { 0 };
+        let ci = (cy * self.w4 + cx) as usize;
+        let mut col_zero = false;
+        if cm.intra[ci] == 0 {
+            let l = if cm.refidx[0][ci] >= 0 { 0 } else { 1 };
+            let mvc = cm.mv[l][ci];
+            col_zero = cm.refidx[l][ci] == 0 && (-1..=1).contains(&mvc[0]) && (-1..=1).contains(&mvc[1]);
+        }
+        for lst in 0..2 {
+            let (rf, mv) = sp[lst];
+            if rf < 0 {
+                self.setblk(ox, oy, 2, 2, lst, -1, [0, 0], 1)?;
+            } else {
+                let mv = if col_zero && rf == 0 { [0, 0] } else { mv };
+                self.setblk(ox, oy, 2, 2, lst, rf, mv, 1)?;
+            }
+        }
+        self.mark(ox, oy, 2, 2);
+        Ok(())
+    }
+}
+
+fn rec_ref(mb: &Mb, lst: usize, p: usize) -> Result<i32> {
+    match mb.refs.as_ref().and_then(|r| r[lst].get(p).copied().flatten()) {
+        Some(v) => Ok(v as i32),
+        None => bail!("TypeError: macroblock ({}, {}) has no reference index for list {lst} partition {p}", mb.x, mb.y),
+    }
+}
+
+fn no_mvd(mb: &Mb) -> anyhow::Error {
+    anyhow!("TypeError: macroblock ({}, {}) has no mvd to use", mb.x, mb.y)
+}
+
+/// The mvd of partition `p` (sub-partition `j` of quadrant `p` for 8x8 MBs).
+fn rec_mvd(mb: &Mb, lst: usize, p: usize, j: Option<usize>) -> Result<[i32; 2]> {
+    match (&mb.mvds, j) {
+        (Some(Mvds::Parts(l)), None) => l[lst].get(p).copied().flatten().ok_or_else(|| no_mvd(mb)),
+        (Some(Mvds::Sub(l)), Some(j)) => l[lst][p].get(j).copied().ok_or_else(|| no_mvd(mb)),
+        _ => Err(no_mvd(mb)),
+    }
+}
+
+fn set_mvd(mb: &mut Mb, lst: usize, p: usize, j: Option<usize>, v: [i32; 2]) -> Result<()> {
+    let slot = match (&mut mb.mvds, j) {
+        (Some(Mvds::Parts(l)), None) => l[lst].get_mut(p).map(|s| *s = Some(v)),
+        (Some(Mvds::Sub(l)), Some(j)) => l[lst][p].get_mut(j).map(|s| *s = v),
+        _ => None,
+    };
+    match slot {
+        Some(()) => Ok(()),
+        None => Err(no_mvd(mb)),
+    }
+}
+
+/// Which prediction list a partition of an MB uses; P slices only have L0.
+fn lst_unused(t: SliceType, pred: Pred, lst: usize) -> bool {
+    (t == SliceType::P && lst == 1) || !pred.uses(lst)
+}
+
+fn derive<R: Recs>(
+    pic: &Picture,
+    recs: &mut R,
+    mb_w: usize,
+    mb_h: usize,
+    pics: &[Picture],
+    col: Option<&Motion>,
+    target: Option<&Motion>,
+) -> Result<Motion> {
+    let t = pic.typ();
+    if t == SliceType::I {
+        return Ok(Motion::all_intra(mb_w, mb_h));
+    }
+    if t != SliceType::P && t != SliceType::B {
+        bail!("slice type {} is not supported", t.as_str());
+    }
+    let spatial = t == SliceType::B && pic.slices[0].direct_spatial == Some(true);
+    let mut d = Derive {
+        m: Motion::new(mb_w, mb_h),
+        w4: (mb_w * 4) as i32,
+        h4: (mb_h * 4) as i32,
+        pic,
+        pics,
+        col,
+        cmx: 0,
+        cmy: 0,
+        done: 0,
+    };
+    let n = recs.recs().len();
+    for i in 0..n {
+        let (cmx, cmy, skip, intra, part, btype, sub) = {
+            let mb = &recs.recs()[i];
+            (mb.x as i32, mb.y as i32, mb.skip, mb.intra, mb.part, mb.btype, mb.sub)
+        };
+        d.cmx = cmx;
+        d.cmy = cmy;
+        d.done = 0;
+        let (x0, y0) = (cmx * 4, cmy * 4);
+        if intra {
+            for y in y0..y0 + 4 {
+                for x in x0..x0 + 4 {
+                    d.m.intra[(y * d.w4 + x) as usize] = 1;
+                }
+            }
+            for lst in 0..2 {
+                d.setblk(x0, y0, 4, 4, lst, -1, [0, 0], 0)?;
+            }
+            continue;
+        }
+        if skip && t == SliceType::P {
+            let a = d.nbr(x0 - 1, y0, 0);
+            let b = d.nbr(x0, y0 - 1, 0);
+            let zero = |n: Option<Nb>| matches!(n, Some((0, [0, 0])));
+            let mv = if a.is_none() || b.is_none() || zero(a) || zero(b) { [0, 0] } else { d.mvp(x0, y0, 4, 0, 0, None, 0) };
+            d.setblk(x0, y0, 4, 4, 0, 0, mv, 0)?;
+            d.setblk(x0, y0, 4, 4, 1, -1, [0, 0], 0)?;
+            continue;
+        }
+        let all_direct = skip || part == Some(Part::Direct);
+        let any_direct = all_direct || (part == Some(Part::P8x8) && t == SliceType::B && sub.is_some_and(|s| s.contains(&0)));
+        // MB-level spatial prediction, from neighbours outside the MB only (so
+        // the same whenever it is computed); only direct blocks use it
+        let sp = if spatial && any_direct { Some(d.spatial_pred()) } else { None };
+        macro_rules! direct {
+            ($i8:expr) => {
+                match &sp {
+                    Some(sp) => d.spatial_direct($i8, sp)?,
+                    None => d.temporal_direct($i8)?,
+                }
+            };
+        }
+        if all_direct {
+            for i8 in 0..4 {
+                direct!(i8);
+            }
+            continue;
+        }
+        let Some(part) = part else { bail!("KeyError: 'part' (macroblock ({cmx}, {cmy}))") };
+        if part != Part::P8x8 {
+            let rects = mb_rects(part);
+            let preds: &[Pred] = if t == SliceType::P {
+                &[Pred::L0, Pred::L0][..rects.len()]
+            } else {
+                match btype {
+                    Some(bt) => B_TYPES[bt as usize].1,
+                    None => bail!("KeyError: 'btype' (macroblock ({cmx}, {cmy}))"),
+                }
+            };
+            for (p, &(rx, ry, rw, rh)) in rects.iter().enumerate() {
+                let (gx, gy) = (x0 + rx, y0 + ry);
+                let Some(&pred) = preds.get(p) else { bail!("list index out of range") };
+                for lst in 0..2 {
+                    if lst_unused(t, pred, lst) {
+                        d.setblk(gx, gy, rw, rh, lst, -1, [0, 0], 0)?;
+                        continue;
+                    }
+                    let rf = rec_ref(&recs.recs()[i], lst, p)?;
+                    let pm = d.mvp(gx, gy, rw, lst, rf, Some(part), p);
+                    if let Some(tg) = target {
+                        let tv = tg.mv[lst][tg.idx(gx as usize, gy as usize)];
+                        let mb = &mut recs.recs_mut().ok_or_else(|| anyhow!("target mode needs writable records"))?[i];
+                        set_mvd(mb, lst, p, None, [tv[0] as i32 - pm[0], tv[1] as i32 - pm[1]])?;
+                    }
+                    let dv = rec_mvd(&recs.recs()[i], lst, p, None)?;
+                    d.setblk(gx, gy, rw, rh, lst, rf, [pm[0] + dv[0], pm[1] + dv[1]], 0)?;
+                }
+                d.mark(gx, gy, rw, rh);
+            }
+            continue;
+        }
+        // 8x8 partitions
+        let Some(sub) = sub else { bail!("KeyError: 'sub' (macroblock ({cmx}, {cmy}))") };
+        for qi in 0..4usize {
+            let st = sub[qi] as usize;
+            let (shape, pred) = if t == SliceType::P {
+                match P_SUB.get(st) {
+                    Some(&s) => (s, Pred::L0),
+                    None => bail!("list index out of range"),
+                }
+            } else {
+                match B_SUB.get(st) {
+                    Some(&sp) => sp,
+                    None => bail!("list index out of range"),
+                }
+            };
+            let (ox, oy) = (x0 + (qi as i32 % 2) * 2, y0 + (qi as i32 / 2) * 2);
+            if shape == SubShape::Direct {
+                direct!(qi as i32);
+                continue;
+            }
+            for (j, &(rx, ry, rw, rh)) in sub_rects(shape).iter().enumerate() {
+                let (gx, gy) = (ox + rx, oy + ry);
+                for lst in 0..2 {
+                    if lst_unused(t, pred, lst) {
+                        d.setblk(gx, gy, rw, rh, lst, -1, [0, 0], 0)?;
+                        continue;
+                    }
+                    let rf = rec_ref(&recs.recs()[i], lst, qi)?;
+                    let pm = d.mvp(gx, gy, rw, lst, rf, None, 0);
+                    if let Some(tg) = target {
+                        let tv = tg.mv[lst][tg.idx(gx as usize, gy as usize)];
+                        let mb = &mut recs.recs_mut().ok_or_else(|| anyhow!("target mode needs writable records"))?[i];
+                        set_mvd(mb, lst, qi, Some(j), [tv[0] as i32 - pm[0], tv[1] as i32 - pm[1]])?;
+                    }
+                    let dv = rec_mvd(&recs.recs()[i], lst, qi, Some(j))?;
+                    d.setblk(gx, gy, rw, rh, lst, rf, [pm[0] + dv[0], pm[1] + dv[1]], 0)?;
+                }
+                d.mark(gx, gy, rw, rh);
+            }
+        }
+    }
+    Ok(d.m)
+}
+
+/// Reconstruct motion for a parsed picture (Python `derive_motion` without
+/// `target`). `pics` is indexed by decode index and supplies POCs (and, for
+/// temporal direct, the co-located picture's POC); `col` is the motion of
+/// RefPicList1[0] (needed for B pictures with direct blocks). Errors where
+/// Python raises (a reference index outside the list, a co-located reference
+/// missing from list 0, direct blocks without `col`).
+pub fn derive_motion(pic: &Picture, mbs: &[Mb], mb_w: usize, mb_h: usize, pics: &[Picture], col: Option<&Motion>) -> Result<Motion> {
+    let mut r = mbs;
+    derive(pic, &mut r, mb_w, mb_h, pics, col, None)
+}
+
+/// [`derive_motion`] in target mode: explicit partitions take their mvs from
+/// `target`, and their mvds are solved and written into `mbs`, so the records
+/// encode exactly that motion under the current neighbourhood.
+pub fn derive_motion_target(
+    pic: &Picture,
+    mbs: &mut [Mb],
+    mb_w: usize,
+    mb_h: usize,
+    pics: &[Picture],
+    col: Option<&Motion>,
+    target: &Motion,
+) -> Result<Motion> {
+    let mut r = mbs;
+    derive(pic, &mut r, mb_w, mb_h, pics, col, Some(target))
 }
 
 #[cfg(test)]
@@ -382,6 +927,95 @@ mod tests {
             }
         }
         !c
+    }
+
+    /// The rectangles `derive` assigns are exactly the partitions of `records::{mb_parts, sub_parts}`,
+    /// in the same order, with the same first block (the one the mv predictor is taken at).
+    #[test]
+    fn partition_rectangles_match_the_tables() {
+        use crate::records::{mb_parts, sub_parts};
+        let cells = |&(x, y, w, h): &(i32, i32, i32, i32)| {
+            let mut v: Vec<(usize, usize)> = (y..y + h).flat_map(|yy| (x..x + w).map(move |xx| (xx as usize, yy as usize))).collect();
+            v.sort();
+            v
+        };
+        for part in [Part::P16x16, Part::P16x8, Part::P8x16] {
+            let (rects, parts) = (mb_rects(part), mb_parts(part));
+            assert_eq!(rects.len(), parts.len());
+            for (r, p) in rects.iter().zip(parts) {
+                let mut sorted = p.to_vec();
+                sorted.sort();
+                assert_eq!(cells(r), sorted);
+                assert_eq!((r.0 as usize, r.1 as usize), p[0]);
+            }
+        }
+        for shape in [SubShape::S8x8, SubShape::S8x4, SubShape::S4x8, SubShape::S4x4] {
+            let (rects, parts) = (sub_rects(shape), sub_parts(shape));
+            assert_eq!(rects.len(), parts.len());
+            for (r, p) in rects.iter().zip(parts) {
+                let mut sorted = p.to_vec();
+                sorted.sort();
+                assert_eq!(cells(r), sorted);
+                assert_eq!((r.0 as usize, r.1 as usize), p[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!(median(3, 1, 2), 2);
+        assert_eq!(median(-5, 7, 0), 0);
+        assert_eq!(median(4, 4, -9), 4);
+        assert_eq!(rect_mask(0, 0, 4, 4), 0xffff);
+        assert_eq!(rect_mask(2, 1, 2, 2), 0b0000_1100_1100_0000);
+        // C division truncates toward zero (the temporal direct scale factor)
+        assert_eq!((16384 + 3 / 2) / -3, -5461);
+    }
+
+    /// Hand-computed P_Skip / mv prediction on a 3x2 MB picture (one reference, no residual).
+    /// Row 0: coded (mvd 8,-4), coded (mvd 4,4), skip. Row 1: coded (mvd 6,6), skip, skip.
+    #[test]
+    fn p_skip_and_mv_prediction() {
+        let mk = |x: u16, y: u16, mvd: Option<[i32; 2]>| {
+            let mut mb = Mb::new(x, y);
+            match mvd {
+                None => mb.skip = true,
+                Some(d) => {
+                    mb.kind = crate::records::Kind::P;
+                    mb.part = Some(Part::P16x16);
+                    mb.refs = Some([vec![Some(0)], vec![None]]);
+                    mb.mvds = Some(Mvds::Parts([vec![Some(d)], vec![None]]));
+                }
+            }
+            mb
+        };
+        let mbs = vec![
+            mk(0, 0, Some([8, -4])),
+            mk(1, 0, Some([4, 4])),
+            mk(2, 0, None),
+            mk(0, 1, Some([6, 6])),
+            mk(1, 1, None),
+            mk(2, 1, None),
+        ];
+        let mut pic = Picture::default();
+        pic.slices = vec![crate::patch::test_slice_header()];
+        pic.lists = [vec![0], vec![]];
+        let m = derive_motion(&pic, &mbs, 3, 2, &[], None).unwrap();
+        let mv = |x: usize, y: usize| m.mv[0][m.idx(x * 4, y * 4)];
+        // MB 0: no neighbours, predictor (0, 0). MB 1: only A: predictor (8, -4).
+        assert_eq!(mv(0, 0), [8, -4]);
+        assert_eq!(mv(1, 0), [12, 0]);
+        // top-row skips: B unavailable, so zero motion
+        assert_eq!(mv(2, 0), [0, 0]);
+        // MB (0,1): A unavailable; B (8,-4) and C (12,0) both use ref 0, median with (0,0) is (8,0)
+        assert_eq!(mv(0, 1), [14, 6]);
+        // MB (1,1) skip: A (14,6), B (12,0), C (0,0): median (12,0)
+        assert_eq!(mv(1, 1), [12, 0]);
+        // MB (2,1) skip: B is a zero-mv reference-0 block: zero motion
+        assert_eq!(mv(2, 1), [0, 0]);
+        assert_eq!(m.refpic[0][m.idx(8, 4)], 0);
+        assert_eq!(m.refidx[1][m.idx(8, 4)], -1);
+        assert!(m.direct.iter().all(|&d| d == 0));
     }
 
     #[test]
