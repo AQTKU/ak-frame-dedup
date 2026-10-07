@@ -224,6 +224,7 @@ def parse_slice(rbsp, nal_type, nal_ref_idc, spss, ppss):
         if h['field_pic']:
             h['bottom_field'] = b.u(1)
     if nal_type == 5:
+        h['idr_pic_id_bit'] = b.p
         h['idr_pic_id'] = b.ue()
     if sps['poc_type'] == 0:
         h['poc_lsb_bit'] = b.p
@@ -275,6 +276,7 @@ def parse_slice(rbsp, nal_type, nal_ref_idc, spss, ppss):
                     b.se(); b.se(); b.se(); b.se()
     # dec_ref_pic_marking
     h['mmco'] = []
+    h['drpm_bit'] = b.p  # dec_ref_pic_marking() spans [drpm_bit, drpm_end_bit)
     if nal_ref_idc:
         if nal_type == 5:
             h['no_output_prior'] = b.u(1)
@@ -294,6 +296,7 @@ def parse_slice(rbsp, nal_type, nal_ref_idc, spss, ppss):
                 if op == 4:
                     args.append(b.ue())
                 h['mmco'].append((op, *args))
+    h['drpm_end_bit'] = b.p
     h['cabac_init_idc'] = 0
     if pps['cabac'] and t not in ('I', 'SI'):
         h['cabac_init_idc'] = b.ue()
