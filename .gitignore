@@ -9,3 +9,6 @@ review/**/*.png
 review/**/cases.json
 __pycache__/
 *.pyc
+
+# Rust build output
+target/

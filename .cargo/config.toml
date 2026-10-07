@@ -1,0 +1,3 @@
+# This machine has crashed under full load: keep builds to a fraction of the CPUs.
+[build]
+jobs = 6
