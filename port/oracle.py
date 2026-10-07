@@ -623,5 +623,338 @@ def encode_edited(path, *pairs):
                     'empty_dc': counts[2], 'qpd': counts[3]}), flush=True)
 
 
+
+def motion_digests(m):
+    """Canonical digests of a Python Motion (same packing as Rust `Motion::canonical_digests`):
+    little-endian arrays row-major by 4x4 block; refpic None = -1."""
+    import hashlib
+
+    import numpy as np
+    bufs = [np.array(m.intra, np.uint8).tobytes(), np.array(m.direct, np.uint8).tobytes(),
+            b''.join(np.array(m.refidx[l], np.int8).tobytes() for l in range(2)),
+            b''.join(np.array(m.mv[l], '<i2').tobytes() for l in range(2)),
+            b''.join(np.array([[-1 if r is None else r for r in row] for row in m.refpic[l]], '<i4').tobytes()
+                     for l in range(2))]
+    h = lambda b: hashlib.sha256(b).hexdigest()
+    return h(b''.join(bufs)), [h(b) for b in bufs]
+
+
+def _motion_task(args):
+    """Motion (and with `target` the re-expression) digests of pictures p0..p1 of an IDR period."""
+    import hashlib
+    import mmap
+    from frame_dedup.h264mv import derive_motion
+    from frame_dedup.roundtrip_test import decode_picture, encode_picture
+    from frame_dedup.stream import load
+    from frame_dedup.verify_motion import reexpress
+    from .canon import canon_mbs, digest
+    path, p0, p1, a, target = args
+    spss, ppss, pics = load(path)
+    f = open(path, 'rb')
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    W, H = spss[0]['mb_w'], spss[0]['mb_h']
+    motions, out = {}, []
+    for d in range(p0, p1):
+        p = pics[d]
+        t = p['type']
+        dd = decode_picture(mm, spss, ppss, p)
+        col = motions.get(p['lists'][1][0]) if t == 'B' else None
+        m = derive_motion(p, dd['mbs'], W, H, pics, col)
+        if d >= a:
+            whole, fields = motion_digests(m)
+            out.append({'dec': d, 'type': t, 'digest': whole, 'intra': fields[0], 'direct': fields[1],
+                        'refidx': fields[2], 'mv': fields[3], 'refpic': fields[4]})
+            if target and t != 'I':
+                new = [reexpress(mb, t, m) for mb in dd['mbs']]
+                m2 = derive_motion(p, new, W, H, pics, col, target=m)
+                bad = sum(1 for l in range(2) for y in range(H * 4) for x in range(W * 4)
+                          if m.refidx[l][y][x] >= 0 and (m.mv[l][y][x] != m2.mv[l][y][x]
+                                                         or m.refidx[l][y][x] != m2.refidx[l][y][x]))
+                rec = digest(canon_mbs(new))
+                nal, _ = encode_picture(dd, new)
+                out.append({'dec': d, 'target': True, 'type': t, 'records': rec, 'bad': bad, 'nal_len': len(nal),
+                            'nal_sha256': hashlib.sha256(nal).hexdigest(), 'motion2': motion_digests(m2)[0]})
+        motions[d] = m
+        if p['ref_idc'] or p['idr']:
+            keep = set(p['dpb_after'])
+            motions = {k: v for k, v in motions.items() if k in keep}
+    return out
+
+
+@command
+def motion(path, *rest):
+    """motion <file.h264> [--from N] [--count N] [--target] [--workers N]: per picture, the digests
+    of the canonical motion field; with --target also the re-expression (all inter MBs explicit 8x8,
+    target-mode mvd solve, re-encode) digests. Derivation starts at the IDR of the period holding
+    --from; one process per IDR period."""
+    import multiprocessing as mp
+    import time
+    from frame_dedup.stream import load
+    from .canon import text
+    opts, it, pos = {'from': 0, 'count': None, 'target': False, 'workers': 1}, iter(rest), []
+    for x in it:
+        if x == '--from':
+            opts['from'] = int(next(it))
+        elif x == '--count':
+            opts['count'] = int(next(it))
+        elif x == '--target':
+            opts['target'] = True
+        elif x == '--workers':
+            opts['workers'] = int(next(it))
+        elif x == '--threads':
+            next(it)
+        else:
+            pos.append(x)
+    _, _, pics = load(path)
+    a = min(opts['from'], len(pics))
+    b = len(pics) if opts['count'] is None else min(a + opts['count'], len(pics))
+    starts = [p['dec'] for p in pics if p['idr']]
+    tasks = []
+    for k, s0 in enumerate(starts):
+        e0 = starts[k + 1] if k + 1 < len(starts) else len(pics)
+        if e0 > a and s0 < b:
+            tasks.append((path, s0, min(e0, b), a, opts['target']))
+    t0 = time.time()
+    with mp.get_context('spawn').Pool(opts['workers']) as pool:
+        for lines in pool.imap(_motion_task, tasks):
+            for l in lines:
+                print(text(l), flush=True)
+    print(f'motion: pictures {a}..{b} in {time.time() - t0:.2f}s', file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# patch_pictures corpus: real calls recorded from Python's repair tasks
+# ---------------------------------------------------------------------------
+
+class _Captured(Exception):
+    pass
+
+
+def _scenario(work, mkv, pkl):
+    """Run the current pipeline (analyse, plan, write) in-process up to the repair call, with the
+    cached proxy features in `work` (in.h264 and features.npz must be there), and capture the
+    arguments `pipeline` passes to `repair`. Cached in `pkl`."""
+    import pickle
+    import types
+    if os.path.exists(pkl):
+        with open(pkl, 'rb') as f:
+            scn = pickle.load(f)
+        if isinstance(scn, tuple):
+            # work/mmco/full_tasks.pkl (written by work/mmco/t_task.py): the repair inputs of the full Amazon run
+            spss, ppss, pics, npics, orig_of_out, sigma = scn
+            w = os.path.join(os.path.dirname(pkl), 'full_work')
+            scn = {'explicit': True, 'orig_es': os.path.join(w, 'in.h264'), 'new_es': os.path.join(w, 'dedup.h264'),
+                   'spss': spss, 'ppss': ppss, 'pics': pics, 'new_pics': npics, 'drop': None, 'sigma': sigma,
+                   'work': ORACLE_DIR, 'orig_of_out': orig_of_out}
+        return scn
+    from frame_dedup import pipeline as P
+    args = types.SimpleNamespace(input=mkv, output=None, work=work, workers=4, report=None, verify=False,
+                                 keep_work=True, dry_run=False, no_rebuild=False, keep_idr_pairs=False)
+    cap = {}
+
+    def fake_repair(*a, **k):
+        cap['args'], cap['kwargs'] = a, dict(k)
+        raise _Captured()
+    P.extract_annexb = lambda *a, **k: None
+    P.repair = fake_repair
+    run = P.Run(args, log=lambda s: print(s, file=sys.stderr, flush=True))
+    run.analyse()
+    run.plan()
+    try:
+        run.write()
+    except _Captured:
+        pass
+    a, k = cap['args'], cap['kwargs']
+    k.pop('log', None)
+    scn = {'explicit': k.get('sigma') is not None, 'orig_es': a[0], 'new_es': a[1], 'spss': a[2], 'ppss': a[3],
+           'pics': a[4], 'new_pics': a[5], 'drop': a[6], 'sigma': k.get('sigma'), 'work': k.get('work'),
+           'orig_of_out': k.get('orig_of_out')}
+    with open(pkl, 'wb') as f:
+        pickle.dump(scn, f)
+    return scn
+
+
+def _scenario_tasks(scn):
+    from frame_dedup import repair as R
+    pics, npics = scn['pics'], scn['new_pics']
+    if scn['explicit']:
+        tasks, cands = R.build_tasks_explicit(pics, npics, dict(enumerate(scn['orig_of_out'])), scn['sigma'])
+    else:
+        new_of = {p['dec']: i for i, p in enumerate(p for p in pics if p['dec'] not in set(scn['drop']))}
+        cands, _ = R.find_candidates(scn['spss'], pics, scn['drop'])
+        tasks = R.build_tasks(pics, npics, new_of, cands)
+    return tasks, cands
+
+
+def _task_force(scn, task):
+    if not scn['explicit']:
+        return []
+    orig, sigma = task['orig'], scn['sigma']
+    new_of = {v: k for k, v in task['orig_of_new'].items()}
+    return sorted(new_of[d] for d in new_of if orig[d]['type'] == 'B' and sigma.get(orig[d]['lists'][1][0]) is not None)
+
+
+def _check_tails(scn, task):
+    """Every picture of the task must carry the slice data of the original picture it is mapped to
+    (explicit mode rewrites headers only), read from the stream files as they are now."""
+    import mmap
+
+    def tail(path, sl):
+        with open(path, 'rb') as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                return bytes(mm[sl['offset'] + sl['size'] - 48:sl['offset'] + sl['size']])
+            finally:
+                mm.close()
+    if not scn['explicit']:
+        return
+    for nd, od in sorted(task['orig_of_new'].items()):
+        a = tail(scn['new_es'], task['new'][nd]['slices'][0])
+        b = tail(scn['orig_es'], task['orig'][od]['slices'][0])
+        assert a == b, f'period {task["period"]}: picture {nd} does not match original {od} in {scn["new_es"]}'
+
+
+@command
+def patch_plan(work, mkv, pkl):
+    """patch-plan <work dir> <input.mkv> <scenario.pkl>: run analyse / plan / write in-process (needs
+    in.h264 and features.npz in the work dir), cache the repair inputs in the pickle, and list the
+    repair tasks: period, pictures, candidate pictures, forced pictures."""
+    from .canon import text
+    scn = _scenario(work, mkv, pkl)
+    tasks, cands = _scenario_tasks(scn)
+    print(text({'explicit': scn['explicit'], 'orig_es': scn['orig_es'], 'new_es': scn['new_es'],
+                'pictures': len(scn['pics']), 'new_pictures': len(scn['new_pics']), 'candidates': len(cands),
+                'tasks': len(tasks)}))
+    cset = set(cands)
+    for t in tasks:
+        n_cand = len(t['cands']) if 'cands' in t else sum(1 for d in t['orig_of_new'].values() if d in cset)
+        print(text({'period': t['period'], 'new_pictures': len(t['new']), 'candidates': n_cand,
+                    'orig_periods': t.get('orig_periods'), 'force': len(_task_force(scn, t)),
+                    'range': [min(t['new']), max(t['new'])]}))
+
+
+def _recorder(real, calls, W):
+    """Wrap `patch_pictures` so that every call appends a record to `calls`: patch sets, the target PCM
+    samples, force, the digests of the NALs returned, the stats and the log lines."""
+    import hashlib
+    import time
+    from frame_dedup.patch import pcm_record
+
+    def wrapped(mm, spss_, ppss_, pics, patches, yuv_of, log=print, parsed=None, stats=None, force=(), cache=None):
+        rec = {'patches': {str(k): [list(v) for v in vs] for k, vs in sorted(patches.items())},
+               'force': sorted(force), 'targets': {}}
+        for d, vs in sorted(patches.items()):
+            if not vs:
+                continue
+            y = yuv_of(d)
+            rec['targets'][str(d)] = {
+                f'{x},{yy}': list((y[(x, yy)] if isinstance(y, dict) else pcm_record(y, W, x, yy))['samples'])
+                for x, yy in sorted(set(map(tuple, vs)))}
+        lines = []
+
+        def lg(s):
+            lines.append(s)
+            log(s)
+        t0 = time.time()
+        repl = real(mm, spss_, ppss_, pics, patches, yuv_of, lg, parsed, stats, force, cache)
+        rec['seconds'] = round(time.time() - t0, 2)
+        rec['repl'] = {str(d): {'len': len(n), 'sha256': hashlib.sha256(n).hexdigest()} for d, n in sorted(repl.items())}
+        rec['stats'] = {str(d): dict(s) for d, s in sorted((stats or {}).items())}
+        rec['log'] = lines
+        calls.append(rec)
+        return repl
+    return wrapped
+
+
+@command
+def patch_record(pkl, out, *periods):
+    """patch-record <scenario.pkl> <corpus.json> <period>...: run the given repair tasks in-process
+    (as work/mmco/t_task.py does) with patch_pictures wrapped to record every call: patch sets, the
+    target PCM samples, force, and the digests of the returned NALs, the stats and the log lines."""
+    import hashlib
+    import time
+    from frame_dedup import repair as R
+    from frame_dedup.patch import pcm_record
+    from .canon import text
+    scn = _scenario(None, None, pkl)
+    spss = scn['spss']
+    W = spss[0]['mb_w']
+    tasks, _ = _scenario_tasks(scn)
+    for g in map(int, periods):   # the scenario's streams must match its task data: slice data tails agree
+        _check_tails(scn, [t for t in tasks if t['period'] == g][0])
+    R._init(scn['orig_es'], scn['new_es'], spss, scn['ppss'], scn['sigma'], scn['work'])
+    calls = []
+    wrapped = _recorder(R.patch_pictures, calls, W)
+    R.patch_pictures = wrapped
+    result = {'explicit': scn['explicit'], 'orig_es': scn['orig_es'], 'new_es': scn['new_es'], 'tasks': []}
+    for g in map(int, periods):
+        task = [t for t in tasks if t['period'] == g][0]
+        calls.clear()
+        t0 = time.time()
+        res = R.run_task(task)
+        print(f'period {g}: {len(task["new"])} pictures, {len(calls)} patch_pictures calls, {res.get("rounds")} rounds, '
+              f'{sum(res["patches"].values())} PCM MBs, {time.time() - t0:.0f} s', file=sys.stderr, flush=True)
+        ent = {'period': g, 'range': [min(task['new']), max(task['new'])], 'force': _task_force(scn, task),
+               'calls': list(calls), 'seconds': res['seconds'], 'rounds': res.get('rounds'),
+               'final_repl': {str(d): hashlib.sha256(n).hexdigest() for d, n in sorted(res['repl'].items())}}
+        if scn['explicit']:
+            ent['orig_of_new'] = {str(k): v for k, v in sorted(task['orig_of_new'].items())}
+        result['tasks'].append(ent)
+        with open(out, 'w') as f:
+            f.write(text(result))
+
+
+@command
+def patch_synth(pkl, out, seed, rounds, density, *periods):
+    """patch-synth <scenario.pkl> <corpus.json> <seed> <rounds> <density> <period>...: synthetic patch_pictures
+    calls on the pictures of exact-mode tasks, for paths the real repairs rarely take (temporal direct made
+    explicit, skip made explicit, QP carriers). Each round adds pseudo-random macroblocks (about `density`
+    per picture over all rounds) with pseudo-random target samples to about a third of the P and B pictures,
+    and calls patch_pictures on the growing patch set with the same `parsed` dict and `cache`, as the measured
+    repair does. The Python results are the oracle."""
+    import hashlib
+    import mmap
+    from frame_dedup import repair as R
+    from frame_dedup.patch import patch_pictures
+    from .canon import text
+    scn = _scenario(None, None, pkl)
+    assert not scn['explicit'], 'patch-synth is for exact-mode scenarios'
+    spss, ppss = scn['spss'], scn['ppss']
+    W, H = spss[0]['mb_w'], spss[0]['mb_h']
+    tasks, _ = _scenario_tasks(scn)
+    with open(scn['new_es'], 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        result = {'explicit': False, 'orig_es': scn['orig_es'], 'new_es': scn['new_es'], 'tasks': []}
+        rng = SplitMix64(int(seed))
+        rounds, density = int(rounds), int(density)
+        for g in map(int, periods):
+            task = [t for t in tasks if t['period'] == g][0]
+            new = task['new']
+            ds = sorted(d for d in new if new[d]['slices'][0]['slice_type'] != 'I')
+            calls, cache, parsed = [], {}, {}
+            patches, targets = {}, {}
+            wrapped = _recorder(patch_pictures, calls, W)
+            for r in range(rounds):
+                for d in ds:
+                    if rng.next() % 3:
+                        continue
+                    for _ in range(max(1, density // rounds)):
+                        x, y = rng.next() % W, rng.next() % H
+                        if (x, y) in targets.get(d, {}):
+                            continue
+                        rec = {'skip': 0, 'kind': 'PCM', 'samples': [rng.next() & 255 for _ in range(384)], 'intra': 1,
+                               'pcm': 1, 'i16': 0, 'direct16': 0, 'cbp': 0x2f, 't8': 0, 'cmode': 0, 'qpd': 0}
+                        targets.setdefault(d, {})[(x, y)] = rec
+                        patches.setdefault(d, []).append((x, y))
+                stats, lines = {}, []
+                wrapped(mm, spss, ppss, new, {k: sorted(v) for k, v in patches.items()}, targets.__getitem__,
+                        log=lines.append, parsed=parsed, stats=stats, force=(), cache=cache)
+            print(f'period {g}: {len(calls)} calls, {sum(len(v) for v in patches.values())} PCM MBs', file=sys.stderr, flush=True)
+            result['tasks'].append({'period': g, 'range': [min(new), max(new)], 'force': [], 'calls': calls})
+        mm.close()
+    with open(out, 'w') as f:
+        f.write(text(result))
+
+
 if __name__ == '__main__':
     main(sys.argv[1:])

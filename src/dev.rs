@@ -25,6 +25,9 @@ pub fn main(args: &[String]) -> Result<()> {
         "train-llr" => crate::evidence::dev_train_llr(rest),
         "detect" => crate::cadence::dev_detect(rest),
         "plan" => crate::plan::dev_plan(rest),
+        "motion" => crate::reexpress::dev_motion(rest),
+        "reexpress" => crate::reexpress::dev_reexpress(rest),
+        "patch-replay" => crate::patch::dev_patch_replay(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }
