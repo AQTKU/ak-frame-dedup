@@ -1400,5 +1400,55 @@ def patch_synth(pkl, out, seed, rounds, density, *periods):
         f.write(text(result))
 
 
+@command
+def verify_inputs(work, mkv, out):
+    """verify-inputs <scratch work dir> <input.mkv> <out.json>: what the pipeline knows when it calls
+    `verify`: run analyse / plan / write in-process (the scratch dir must hold in.h264 and features.npz,
+    e.g. hard links to a baseline's; dedup.h264 is written there), stop at the repair / rebuild call,
+    and write the original decode index of every output picture of the final stream (`orig_of_out`)
+    with the rates. For `dev verify`."""
+    import types
+    from frame_dedup import pipeline as P
+    from .canon import text
+    args = types.SimpleNamespace(input=mkv, output=None, work=work, workers=4, report=None, verify=False,
+                                 keep_work=True, dry_run=False, no_rebuild=False, keep_idr_pairs=False)
+    cap = {}
+
+    def fake(name):
+        def f(*a, **k):
+            cap[name] = a
+            raise _Captured()
+        return f
+    P.extract_annexb = lambda *a, **k: None
+    P.repair = fake('repair')
+    P.rebuild = fake('rebuild')
+    run = P.Run(args, log=lambda s: print(s, file=sys.stderr, flush=True))
+    run.analyse()
+    run.plan()
+    try:
+        run.write()
+    except _Captured:
+        pass
+    if run.explicit:
+        orig = list(run.orig_of_out)
+    else:
+        if 'rebuild' in cap:
+            src_orig = list(cap['rebuild'][7])
+        elif 'repair' in cap:
+            drop_dec = cap['repair'][6]
+            src_orig = [p['dec'] for p in run.pics if p['dec'] not in drop_dec]
+        else:
+            src_orig = list(run.orig_of_out)
+        # an anchor rebuild writes D (as I2) in K's slot and drops D's own
+        for r in run.rebuilds:
+            iK, iD = src_orig.index(r['K_dec']), src_orig.index(r['D_dec'])
+            src_orig[iK] = r['D_dec']
+            del src_orig[iD]
+        orig = src_orig
+    with open(out, 'w') as f:
+        f.write(text({'orig_of_out': orig, 'fps_in': str(run.fps_in), 'fps_out': str(run.fps_out),
+                      'explicit': run.explicit}))
+
+
 if __name__ == '__main__':
     main(sys.argv[1:])
