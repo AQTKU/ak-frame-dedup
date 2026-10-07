@@ -17,8 +17,8 @@ BELOW_NORMAL = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
 
 FFMPEG_THREADS = 2          # threads per full-res decoder when many run at once
 RAM_FRACTION = 0.40         # budget for a pool: workers x peak <= this x physical RAM
-REPAIR_PEAK = 1.6e9         # measured peak working set of one repair worker (bytes), with margin
-VERIFY_PEAK = 0.4e9         # same for a verify worker
+REPAIR_PEAK = 0.8e9         # budget per repair worker (measured peak ~240 MB on sample.mkv)
+VERIFY_PEAK = 0.5e9         # budget per verify worker (measured peak ~235 MB)
 
 
 def default_workers():

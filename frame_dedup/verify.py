@@ -22,7 +22,7 @@ def mb_maxdiff(a, b, W, H):
     ly = d[:w * h].reshape(H, 16, W, 16).max(axis=(1, 3))
     u = d[w * h:w * h * 5 // 4].reshape(H, 8, W, 8).max(axis=(1, 3))
     v = d[w * h * 5 // 4:].reshape(H, 8, W, 8).max(axis=(1, 3))
-    return np.maximum(ly, np.maximum(u, v))
+    return np.maximum(ly, np.maximum(u, v)), ly
 
 
 def _job(args):
@@ -61,10 +61,11 @@ def _job(args):
                 if not bad:
                     break
                 if key in bad:
-                    m = mb_maxdiff(fo, bad.pop(key), W, H)
+                    m, ly = mb_maxdiff(fo, bad.pop(key), W, H)
                     res['differing'].append({'display': disp_of[key], 'period': key[0], 'poc': key[1],
                                              'worst': int(m.max()), 'mbs_ge3': int((m >= 3).sum()),
-                                             'mbs_diff': int((m > 0).sum())})
+                                             'mbs_diff': int((m > 0).sum()), 'worst_luma': int(ly.max()),
+                                             'mbs_ge3_luma': int((ly >= 3).sum())})
     except (RuntimeError, KeyError) as e:
         res['errors'].append(f'{type(e).__name__}: {e}')
     res['peak_rss'] = peak_rss()
@@ -105,7 +106,9 @@ def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group
             n = 0
     flush()
     tot = {'compared': 0, 'exact': 0, 'differing': [], 'errors': []}
-    nproc = pool_size(workers, VERIFY_PEAK, len(jobs))
+    # each verify worker keeps a 2-thread ffmpeg decoder busy, so use half
+    # the worker budget to stay near the same CPU load as the other stages
+    nproc = pool_size(max(1, workers // 2), VERIFY_PEAK, len(jobs))
     log(f'  verify: {len(jobs)} groups on {nproc} workers (one decoder each)')
     peak = 0
     with mp.get_context('spawn').Pool(nproc, initializer=worker_init) as pool:
@@ -124,6 +127,8 @@ def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group
         'frames_output': len(out_pics), 'frames_compared': tot['compared'], 'bit_exact': tot['exact'],
         'differing': len(diff), 'worst_difference': max((d['worst'] for d in diff), default=0),
         'mbs_ge3': sum(d['mbs_ge3'] for d in diff), 'mbs_differing': sum(d['mbs_diff'] for d in diff),
+        'worst_luma': max((d['worst_luma'] for d in diff), default=0),
+        'mbs_ge3_luma': sum(d['mbs_ge3_luma'] for d in diff),
         'errors': tot['errors'], 'workers': nproc, 'worker_peak_rss_mb': round(peak / 2**20),
         'differing_frames': diff,
     }

@@ -76,4 +76,9 @@ def duration_check(in_mkv, out_mkv, n_out, fps_out):
         res['within_one_frame_of_input'] = abs(res['video_duration_change_s']) <= frame
     if 'output_av_diff_s' in res:
         res['within_one_frame_of_audio'] = abs(res['output_av_diff_s']) <= frame
+    if 'output_av_diff_s' in res and 'input_av_diff_s' in res:
+        # the input may already end its video and audio a little apart; what
+        # the tool must preserve is that gap
+        res['av_gap_change_s'] = round(res['output_av_diff_s'] - res['input_av_diff_s'], 4)
+        res['av_gap_change_within_one_frame'] = abs(res['av_gap_change_s']) <= frame
     return res

@@ -229,7 +229,8 @@ class Run:
         dc = duration_check(a.input, a.output, n_out, self.fps_out)
         self.report['durations'] = dc
         self.log(f"durations: video {dc.get('output_video_s')} s, audio {dc.get('output_audio_s')} s "
-                 f"(input video {dc.get('input_video_s')} s, audio {dc.get('input_audio_s')} s)")
+                 f"(input video {dc.get('input_video_s')} s, audio {dc.get('input_audio_s')} s); "
+                 f"A/V gap change {dc.get('av_gap_change_s')} s")
         self.stage('mux', t)
 
     # ------------------------------------------------------------------
@@ -253,7 +254,8 @@ class Run:
         res['ok'] = not outside and not res['errors'] and res['frames_compared'] == res['frames_output']
         self.report['verify'] = res
         self.log(f"verify: {res['frames_compared']} frames compared, {res['bit_exact']} bit-exact, "
-                 f"{res['differing']} differ (worst {res['worst_difference']}, {res['mbs_ge3']} MBs >= 3), "
+                 f"{res['differing']} differ (worst {res['worst_difference']}, {res['mbs_ge3']} MBs >= 3; "
+                 f"luma worst {res['worst_luma']}, {res['mbs_ge3_luma']} MBs >= 3), "
                  f"{len(outside)} differing outside hard-drop neighbourhoods; errors {len(res['errors'])}")
         self.stage('verify', t)
 
