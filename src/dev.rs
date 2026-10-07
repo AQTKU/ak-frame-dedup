@@ -36,6 +36,8 @@ pub fn main(args: &[String]) -> Result<()> {
         "motion" => crate::reexpress::dev_motion(rest),
         "reexpress" => crate::reexpress::dev_reexpress(rest),
         "patch-replay" => crate::patch::dev_patch_replay(rest),
+        "repair" => crate::repair::dev_repair(rest),
+        "rebuild" => crate::rebuild::dev_rebuild(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }

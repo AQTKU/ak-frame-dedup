@@ -8,23 +8,33 @@
 //! D's former IDR period is merged into K's: its POCs are shifted by the
 //! constant POC(K) - POC(D) and frame_num continues from K's.
 //!
-//! This file has the header side only (demotion, planning, list check,
-//! eligibility, writing). The B1-B3 re-encoding and the parallel driver come
-//! with the CABAC codec.
+//! The header side (demotion, planning, list check, eligibility, writing),
+//! the B1-B3 re-encoding (`run_task`, with the PCM rounds) and the parallel
+//! driver (`rebuild`, one task per pair, worker threads sharing the mapped
+//! streams).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use memmap2::Mmap;
 
 use crate::bits::{BitWriter, escape, set_bits, unescape};
 use crate::h264hdr::{Picture, Ppss, SliceHeader, Sps, Spss, parse_slice};
-use crate::mv::dpb_walk;
+use crate::decode::{decode_pocs, frame_size, iter_frames};
+use crate::mv::{Motion, derive_motion, derive_motion_target, dpb_walk};
+use crate::patch::{fix_qp, pcm_record, qp_chain, same_motion};
+use crate::picture::{Parsed, decode_picture, try_encode_picture};
+use crate::records::{Kind, Mb};
+use crate::reexpress::{has_direct, reexpress_compact};
+use crate::repair::{TmpFile, map_file, round1, run_pool};
+use crate::system::{FFMPEG_THREADS, REPAIR_PEAK, pool_size};
+use crate::verify::mb_maxdiff;
 
 /// sei_message: payloadType 6 (recovery point), payloadSize 1,
 /// recovery_frame_cnt ue 0 ('1'), exact_match 1, broken_link 0,
@@ -45,6 +55,243 @@ pub const MAX_ROUNDS: usize = 4;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// One re-encoding task: the B1-B3 pictures of one rebuild.
+struct Task {
+    /// Decode range of K's period through D in the source stream.
+    seg: Range<usize>,
+    /// First (an IDR) and last original decode index to decode for the
+    /// original pixels of the leading pictures.
+    orig_first: usize,
+    orig_last: usize,
+}
+
+struct Ctx<'a> {
+    orig_es: &'a Path,
+    src_es: &'a Path,
+    src_map: &'a [u8],
+    spss: &'a Spss,
+    ppss: &'a Ppss,
+    orig_pics: &'a [Picture],
+    src_pics: &'a [Picture],
+    orig_of_src: &'a [usize],
+    rebuilds: &'a [Rebuild],
+    work: &'a Path,
+}
+
+/// Statistics of one leading picture (Python's `stats[b]` dict).
+#[derive(Clone, Debug, Default)]
+struct BStat {
+    src_dec: usize,
+    display_in: usize,
+    direct_explicit: usize,
+    bytes_before: usize,
+    skip_explicit: usize,
+    qp_carrier: usize,
+    pcm: usize,
+    bytes_after: usize,
+    worst: u32,
+    mbs_ge3: usize,
+    mbs_diff: usize,
+    worst_luma: u32,
+    mbs_ge3_luma: usize,
+    rounds: usize,
+    pcm_capped: bool,
+}
+
+impl BStat {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "src_dec": self.src_dec, "display_in": self.display_in, "direct_explicit": self.direct_explicit,
+            "bytes_before": self.bytes_before, "skip_explicit": self.skip_explicit, "qp_carrier": self.qp_carrier,
+            "pcm": self.pcm, "bytes_after": self.bytes_after, "worst": self.worst, "mbs_ge3": self.mbs_ge3,
+            "mbs_diff": self.mbs_diff, "worst_luma": self.worst_luma, "mbs_ge3_luma": self.mbs_ge3_luma,
+            "rounds": self.rounds, "pcm_capped": self.pcm_capped,
+        })
+    }
+}
+
+struct TaskResult {
+    repl: HashMap<usize, Vec<u8>>,
+    stats: Vec<BStat>,
+    seconds: f64,
+}
+
+/// Records for a B1-B3 picture: `base` (direct blocks made explicit) with the
+/// MBs in `pcm` replaced by I_PCM copies of `yuv`, skips that can no longer
+/// inherit their QP made explicit, mvds re-solved and the QP chain kept.
+/// Returns (records, number of skips made explicit, QP carriers).
+#[allow(clippy::too_many_arguments)]
+fn build_b(
+    pic: &Picture,
+    dd: &Parsed,
+    base: &[Mb],
+    m0: &Motion,
+    pcm: &BTreeSet<(u16, u16)>,
+    yuv: &[u8],
+    pics: &[Picture],
+    intra: &Motion,
+    w: usize,
+    h: usize,
+) -> Result<(Vec<Mb>, usize, usize)> {
+    let mut new: Vec<Mb> = base.to_vec();
+    for mb in new.iter_mut() {
+        if pcm.contains(&(mb.x, mb.y)) {
+            let (x, y) = (mb.x, mb.y);
+            let mut r = pcm_record(yuv, w, x as usize, y as usize);
+            r.x = x;
+            r.y = y;
+            *mb = r;
+        }
+    }
+    let qp = pic.slices[0].qp;
+    let target_qp = qp_chain(&dd.mbs, qp);
+    let (mut pred, mut n_skip) = (qp, 0usize);
+    for (i, mb) in new.iter_mut().enumerate() {
+        if mb.kind == Kind::Pcm {
+            continue;
+        }
+        if mb.skip && target_qp[i] != pred {
+            *mb = reexpress_compact(mb, m0);
+            n_skip += 1;
+        }
+        pred = target_qp[i];
+    }
+    let m2 = derive_motion_target(pic, &mut new, w, h, pics, Some(intra), m0)?;
+    let bad: Vec<String> = new
+        .iter()
+        .filter(|mb| mb.kind != Kind::Pcm && !mb.intra && !same_motion(m0, &m2, mb.x as usize, mb.y as usize))
+        .take(5)
+        .map(|mb| format!("({}, {})", mb.x, mb.y))
+        .collect();
+    if !bad.is_empty() {
+        bail!("AssertionError: dec {}: motion could not be preserved at [{}]", pic.dec, bad.join(", "));
+    }
+    let forced = fix_qp(&mut new, &target_qp, qp)?;
+    Ok((new, n_skip, forced))
+}
+
+/// Re-encode B1-B3 of one rebuild. Returns their NALs and statistics.
+fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
+    let t0 = Instant::now();
+    let sps = cx.spss.get(&0).ok_or_else(|| anyhow!("KeyError: 0 (no SPS with id 0)"))?;
+    let (w, h) = (sps.mb_w, sps.mb_h);
+    let fs = frame_size(sps);
+    let r = &cx.rebuilds[ri];
+    let (k, bs) = (r.k, &r.b);
+    let src = cx.src_pics;
+    let intra = Motion::all_intra(w, h);
+    let dk = decode_picture(cx.src_map, cx.spss, cx.ppss, &src[k])?;
+    let mk = derive_motion(&src[k], &dk.mbs, w, h, src, None)?;
+    // (records, base records, motion with K)
+    let mut recs: Vec<(Parsed, Vec<Mb>, Motion)> = Vec::new();
+    let mut stats: Vec<BStat> = Vec::new();
+    for &b in bs {
+        let pb = &src[b];
+        if pb.lists[1].first() != Some(&k) {
+            bail!("AssertionError: picture {b} does not have K as its first list 1 entry");
+        }
+        let dd = decode_picture(cx.src_map, cx.spss, cx.ppss, pb)?;
+        let m0 = derive_motion(pb, &dd.mbs, w, h, src, Some(&mk))?; // what B decoded with K
+        let m1 = derive_motion(pb, &dd.mbs, w, h, src, Some(&intra))?; // what its records give with I2
+        let mut base = Vec::with_capacity(dd.mbs.len());
+        let mut n_dir = 0;
+        for mb in &dd.mbs {
+            if has_direct(mb) && !same_motion(&m0, &m1, mb.x as usize, mb.y as usize) {
+                base.push(reexpress_compact(mb, &m0));
+                n_dir += 1;
+            } else {
+                base.push(mb.clone());
+            }
+        }
+        stats.push(BStat {
+            src_dec: b,
+            display_in: cx.orig_pics[cx.orig_of_src[b]].disp,
+            direct_explicit: n_dir,
+            bytes_before: dd.nal_len,
+            ..Default::default()
+        });
+        recs.push((dd, base, m0));
+    }
+    drop(dk);
+
+    // original pixels of B1-B3
+    let orig_poc: Vec<i32> = bs.iter().map(|&b| cx.orig_pics[cx.orig_of_src[b]].poc).collect();
+    let want: BTreeSet<i32> = orig_poc.iter().copied().collect();
+    let frames = decode_pocs(cx.orig_es, cx.orig_pics, task.orig_first, task.orig_last + 1, &want, fs, FFMPEG_THREADS)?;
+    let target: Vec<&Vec<u8>> = orig_poc.iter().map(|p| frames.get(p).ok_or_else(|| anyhow!("KeyError: {p}"))).collect::<Result<_>>()?;
+
+    let tmp = TmpFile(cx.work.join(format!("rebuild_{k}.h264")));
+    let mut pcm: Vec<BTreeSet<(u16, u16)>> = vec![BTreeSet::new(); bs.len()];
+    let budget = (PCM_MAX_FRACTION * w as f64 * h as f64) as usize;
+    let seg = &src[task.seg.clone()];
+    let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
+    for rnd in 0..MAX_ROUNDS {
+        repl.clear();
+        for (i, &b) in bs.iter().enumerate() {
+            let (dd, base, m0) = &recs[i];
+            let (mut new, n_skip, forced) = build_b(&src[b], dd, base, m0, &pcm[i], target[i], src, &intra, w, h)?;
+            let nal = try_encode_picture(dd, cx.spss, cx.ppss, &mut new).with_context(|| format!("dec {b}"))?;
+            stats[i].skip_explicit = n_skip;
+            stats[i].qp_carrier = forced;
+            stats[i].pcm = pcm[i].len();
+            stats[i].bytes_after = nal.len();
+            repl.insert(b, nal);
+        }
+        let entries = write_rebuilt(cx.src_es, seg, task.seg.start, cx.spss, cx.ppss, &tmp.0, std::slice::from_ref(r), &repl)?;
+        let mut order: Vec<(i32, usize)> = entries.iter().map(|e| (e.poc, e.pic)).collect();
+        order.sort_unstable();
+        let mut got: HashMap<usize, Vec<u8>> = HashMap::new();
+        {
+            let size = std::fs::metadata(&tmp.0)?.len() as usize;
+            let mut it = iter_frames(&tmp.0, &[(0, size)], fs, FFMPEG_THREADS)?;
+            let mut fr = Vec::new();
+            for &(_, dec) in &order {
+                if !it.next_frame(&mut fr)? {
+                    break;
+                }
+                if bs.contains(&dec) {
+                    got.insert(dec, fr.clone());
+                }
+            }
+        }
+        if got.len() != bs.len() || !bs.iter().all(|b| got.contains_key(b)) {
+            bail!("AssertionError: segment decode lost a leading picture");
+        }
+        let mut grew = false;
+        for (i, &b) in bs.iter().enumerate() {
+            let (m, ly) = mb_maxdiff(&got[&b], target[i], w, h);
+            let st = &mut stats[i];
+            st.worst = m.iter().copied().max().unwrap_or(0) as u32;
+            st.mbs_ge3 = m.iter().filter(|&&v| v >= 3).count();
+            st.mbs_diff = m.iter().filter(|&&v| v > 0).count();
+            st.worst_luma = ly.iter().copied().max().unwrap_or(0) as u32;
+            st.mbs_ge3_luma = ly.iter().filter(|&&v| v >= 3).count();
+            st.rounds = rnd + 1;
+            let mut more: Vec<(u8, u16, u16)> = Vec::new();
+            for (j, &v) in m.iter().enumerate() {
+                if v as u32 >= PCM_THRESHOLD {
+                    let (x, y) = ((j % w) as u16, (j / w) as u16);
+                    if !pcm[i].contains(&(x, y)) {
+                        more.push((v, x, y));
+                    }
+                }
+            }
+            more.sort_by(|a, b| b.cmp(a)); // sorted(..., reverse=True)
+            let room = budget as i64 - pcm[i].len() as i64;
+            st.pcm_capped = more.len() as i64 > room;
+            if !more.is_empty() && room > 0 {
+                pcm[i].extend(more.iter().take(room as usize).map(|&(_, x, y)| (x, y)));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    drop(tmp);
+    Ok(TaskResult { repl, stats, seconds: round1(t0.elapsed().as_secs_f64()) })
+}
+
 /// Apply `rebuilds` (decode indices of the stream `src_es`, parsed as
 /// `src_pics`; `orig_of_src` maps them to the original stream's) and write
 /// `out_path`. Returns (the original decode index of every output picture in
@@ -52,20 +299,114 @@ const START_CODE: [u8; 4] = [0, 0, 0, 1];
 /// keys). Python: `rebuild.rebuild`.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild(
-    _orig_es: &Path,
-    _src_es: &Path,
-    _out_path: &Path,
-    _spss: &Spss,
-    _ppss: &Ppss,
-    _orig_pics: &[Picture],
-    _src_pics: &[Picture],
-    _orig_of_src: &[usize],
-    _rebuilds: &[Rebuild],
-    _workers: usize,
-    _work: &Path,
-    _log: &crate::system::Logger,
+    orig_es: &Path,
+    src_es: &Path,
+    out_path: &Path,
+    spss: &Spss,
+    ppss: &Ppss,
+    orig_pics: &[Picture],
+    src_pics: &[Picture],
+    orig_of_src: &[usize],
+    rebuilds: &[Rebuild],
+    workers: usize,
+    work: &Path,
+    log: &crate::system::Logger,
 ) -> Result<(Vec<usize>, serde_json::Value)> {
-    todo!("port rebuild.rebuild (B1-B3 re-encoding and the parallel driver)")
+    let t0 = Instant::now();
+    let chk = check_lists(spss, src_pics, 0, rebuilds)?;
+    if !chk.fails.is_empty() {
+        let first: Vec<String> = chk.fails.iter().take(3).map(|f| f.to_string()).collect();
+        bail!("anchor rebuild would change reference lists: [{}]", first.join(", "));
+    }
+    let periods = crate::stream::period_ranges(src_pics);
+    let mut tasks = Vec::new();
+    for r in rebuilds {
+        let kp = &src_pics[r.k];
+        let seg = periods[kp.period].start..r.d + 1;
+        let ob: Vec<usize> = r.b.iter().map(|&b| orig_of_src[b]).collect();
+        let (Some(&lo), Some(&hi)) = (ob.iter().min(), ob.iter().max()) else {
+            bail!("ValueError: min() arg is an empty sequence");
+        };
+        let orig_first = (0..=lo).rev().find(|&d| orig_pics[d].idr).ok_or_else(|| anyhow!("ValueError: max() arg is an empty sequence"))?;
+        tasks.push(Task { seg, orig_first, orig_last: hi });
+    }
+    let nproc = if tasks.is_empty() { 0 } else { pool_size(workers, REPAIR_PEAK, Some(tasks.len())) };
+    log.log(&format!(
+        "anchor rebuild: {} pairs, {} leading B pictures, {nproc} workers",
+        tasks.len(),
+        rebuilds.iter().map(|r| r.b.len()).sum::<usize>()
+    ));
+    let mut results: Vec<TaskResult> = Vec::new();
+    if !tasks.is_empty() {
+        let src_map = map_file(src_es)?;
+        let cx = Ctx { orig_es, src_es, src_map: &src_map, spss, ppss, orig_pics, src_pics, orig_of_src, rebuilds, work };
+        let idx: Vec<(usize, &Task)> = tasks.iter().enumerate().collect();
+        let n = tasks.len();
+        let work_fn = |t: &(usize, &Task)| run_task(&cx, t.0, t.1);
+        results = run_pool(nproc, &idx, &work_fn, |i, _| {
+            if (i + 1) % 25 == 0 || i + 1 == n {
+                log.log(&format!("  rebuild: {}/{n} pairs", i + 1));
+            }
+        })?;
+    }
+    let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
+    for res in &results {
+        for (b, nal) in &res.repl {
+            repl.insert(*b, nal.clone());
+        }
+    }
+    let entries = write_rebuilt(src_es, src_pics, 0, spss, ppss, out_path, rebuilds, &repl)?;
+    let out_src: Vec<usize> = entries.iter().map(|e| e.pic).collect();
+
+    // the written stream must parse to exactly the planned POCs and lists
+    let (_, _, out_pics) = crate::stream::load(out_path)?;
+    if out_pics.len() != chk.shadow.len() {
+        bail!("AssertionError: the written stream has {} pictures, {} planned", out_pics.len(), chk.shadow.len());
+    }
+    for (q, s) in out_pics.iter().zip(&chk.shadow) {
+        if q.poc != s.poc || q.lists != s.lists || q.idr != s.idr {
+            bail!("AssertionError: {}", q.dec);
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let mut worst = 0u32;
+    let (mut n_leading, mut n_capped_pairs, mut pcm_total, mut direct_total, mut bytes_total) = (0usize, 0usize, 0usize, 0usize, 0i64);
+    for (r, res) in rebuilds.iter().zip(&results) {
+        let st = &res.stats;
+        worst = worst.max(st.iter().map(|s| s.worst).max().unwrap_or(0));
+        let pcm_mbs: usize = st.iter().map(|s| s.pcm).sum();
+        let direct_explicit: usize = st.iter().map(|s| s.direct_explicit).sum();
+        let bytes_added: i64 = st.iter().map(|s| s.bytes_after as i64 - s.bytes_before as i64).sum();
+        let pcm_capped = st.iter().filter(|s| s.pcm_capped).count();
+        n_leading += st.len();
+        n_capped_pairs += pcm_capped;
+        pcm_total += pcm_mbs;
+        direct_total += direct_explicit;
+        bytes_total += bytes_added;
+        pairs.push(serde_json::json!({
+            "display": orig_pics[orig_of_src[r.k]].disp,
+            "kept_display": orig_pics[orig_of_src[r.d]].disp,
+            "types": format!("{}Ii", src_pics[r.k].typ().as_str()),
+            "leading_b": st.len(), "pcm_mbs": pcm_mbs, "direct_explicit": direct_explicit, "bytes_added": bytes_added,
+            "worst": st.iter().map(|s| s.worst).max().unwrap_or(0),
+            "mbs_ge3": st.iter().map(|s| s.mbs_ge3).sum::<usize>(),
+            "worst_luma": st.iter().map(|s| s.worst_luma).max().unwrap_or(0),
+            "pcm_capped": pcm_capped,
+            "pictures": st.iter().map(BStat::to_json).collect::<Vec<_>>(),
+            "seconds": res.seconds,
+        }));
+    }
+    let sps = spss.get(&0).ok_or_else(|| anyhow!("KeyError: 0 (no SPS with id 0)"))?;
+    let summary = serde_json::json!({
+        "pairs": pairs.len(), "leading_b_pictures": n_leading,
+        "pcm_threshold": PCM_THRESHOLD, "pcm_max_per_picture": (PCM_MAX_FRACTION * sps.mb_w as f64 * sps.mb_h as f64) as usize,
+        "pictures_pcm_capped": n_capped_pairs, "pcm_mbs": pcm_total, "direct_explicit": direct_total,
+        "bytes_added": bytes_total, "worst_in_leading_b": worst, "workers": nproc,
+        "worker_peak_rss_mb": (crate::system::peak_rss() as f64 / (1u64 << 20) as f64).round() as u64,
+        "seconds": round1(t0.elapsed().as_secs_f64()), "pairs_detail": pairs,
+    });
+    Ok((out_src.iter().map(|&d| orig_of_src[d]).collect(), summary))
 }
 
 /// A planned rebuild (Python: `{'K', 'D', 'B'}`): K the dropped P, D the IDR
@@ -538,5 +879,73 @@ pub fn dev_write_rebuilt(args: &[String]) -> Result<()> {
             print_line(json!([e.pic, e.i2, e.frame_num, e.poc]));
         }
     }
+    Ok(())
+}
+
+/// `frame-dedup dev rebuild <scenario.json> --out rebuilt.h264 [--report r.json] [--workers N] [--work DIR]`:
+/// run the anchor rebuild on the streams named in the scenario (written by
+/// `python -m port.oracle repair-scenario`: `orig_es`, `rebuild.src_es`,
+/// `rebuild.src_orig`, `rebuild.rbs`), write the rebuilt stream and the
+/// `anchor_rebuilds` report section. Prints the timing.
+pub fn dev_rebuild(args: &[String]) -> Result<()> {
+    use serde_json::{Value, json};
+    const USAGE: &str = "frame-dedup dev rebuild <scenario.json> --out rebuilt.h264 [--report r.json] [--workers N] [--work DIR]";
+    let (mut scen, mut out, mut report, mut workers, mut work) = (None, None, None, 4usize, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = |n: &str| it.next().cloned().ok_or_else(|| anyhow!("{n} needs a value"));
+        match a.as_str() {
+            "--out" => out = Some(val("--out")?),
+            "--report" => report = Some(val("--report")?),
+            "--workers" => workers = val("--workers")?.parse()?,
+            "--work" => work = Some(val("--work")?),
+            _ if scen.is_none() => scen = Some(a.clone()),
+            _ => bail!("usage: {USAGE}"),
+        }
+    }
+    let scen = scen.ok_or_else(|| anyhow!("usage: {USAGE}"))?;
+    let out = out.ok_or_else(|| anyhow!("--out is required"))?;
+    let j: Value = serde_json::from_str(&std::fs::read_to_string(&scen)?)?;
+    let s = |v: &Value, k: &str| v[k].as_str().map(std::path::PathBuf::from).ok_or_else(|| anyhow!("scenario has no {k}"));
+    let rj = &j["rebuild"];
+    if rj.is_null() {
+        bail!("the scenario has no rebuild section");
+    }
+    let orig_es = s(&j, "orig_es")?;
+    let src_es = s(rj, "src_es")?;
+    let work = match work {
+        Some(w) => std::path::PathBuf::from(w),
+        None => s(&j, "work")?,
+    };
+    let ids = |v: &Value| -> Vec<usize> { v.as_array().map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect()).unwrap_or_default() };
+    let src_orig = ids(&rj["src_orig"]);
+    let rbs: Vec<Rebuild> = rj["rbs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("scenario has no rebuild.rbs"))?
+        .iter()
+        .map(|r| Rebuild { k: r["K"].as_u64().unwrap() as usize, d: r["D"].as_u64().unwrap() as usize, b: ids(&r["B"]) })
+        .collect();
+    crate::system::lower_priority();
+    let log = crate::system::Logger::new(None)?;
+    let (_spss, _ppss, orig_pics) = crate::stream::load(&orig_es)?;
+    let (nspss, nppss, src_pics) = crate::stream::load(&src_es)?;
+    if src_pics.len() != src_orig.len() {
+        bail!("the source stream has {} pictures, the scenario maps {}", src_pics.len(), src_orig.len());
+    }
+    let t0 = Instant::now();
+    let (orig_of_out, rb) = rebuild(&orig_es, &src_es, Path::new(&out), &nspss, &nppss, &orig_pics, &src_pics, &src_orig, &rbs, workers, &work, &log)?;
+    let secs = t0.elapsed().as_secs_f64();
+    if let Some(r) = &report {
+        std::fs::write(r, crate::records::canonical_text(&json!({"anchor_rebuilds": rb, "orig_of_out": orig_of_out, "wall_seconds": secs})))?;
+    }
+    println!(
+        "rebuild: {} pairs, {} leading B pictures, {} PCM MBs, {:+} bytes; {:.1} s; process peak {} MB",
+        rb["pairs"],
+        rb["leading_b_pictures"],
+        rb["pcm_mbs"],
+        rb["bytes_added"].as_i64().unwrap_or(0),
+        secs,
+        crate::system::peak_rss() >> 20
+    );
     Ok(())
 }
