@@ -92,7 +92,7 @@ def test_phase_change_at_black_and_sync():
     # A/V sync: after corrections the mean offset of every stretch is within half a frame
     disp = [{'dec': i, 'ref_idc': 0, 'idr': i == 0, 'type': 'B'} for i in range(N)]
     disp[0]['ref_idc'] = 1
-    drop, hard, uns = choose_drops(disp, dup)
+    drop, hard, uns, _, _ = choose_drops(disp, dup)
     drop, corr = sync_correct(disp, drop, r, black, [])
     off = offsets(N, drop, r)
     assert abs(np.nanmean(off[9040:])) <= 0.5

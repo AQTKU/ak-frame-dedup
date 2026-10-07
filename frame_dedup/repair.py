@@ -74,8 +74,10 @@ def _init(orig_es, new_es, spss, ppss):
     _G.update(orig_es=orig_es, new_es=new_es, spss=spss, ppss=ppss)
 
 
-def changed_mbs(m_orig, m_new, orig_of_new, W, H):
-    out = set()
+def changed_blocks(m_orig, m_new, orig_of_new, W, H):
+    """4x4 blocks whose reference picture or motion vector differs between
+    the original and the new reference context."""
+    out = []
     for gy in range(H * 4):
         for gx in range(W * 4):
             for l in range(2):
@@ -83,9 +85,72 @@ def changed_mbs(m_orig, m_new, orig_of_new, W, H):
                 rn = m_new.refpic[l][gy][gx]
                 rn = None if rn is None else orig_of_new[rn]
                 if ro != rn or (ro is not None and m_orig.mv[l][gy][gx] != m_new.mv[l][gy][gx]):
-                    out.add((gx // 4, gy // 4))
+                    out.append((gx, gy))
                     break
     return out
+
+
+def _mb_rect(gx, gy, mv, W, H):
+    """Macroblocks a 4x4 block's luma and chroma prediction can read
+    (6-tap / bilinear margins, generously rounded)."""
+    x = gx * 4 + (mv[0] >> 2)
+    y = gy * 4 + (mv[1] >> 2)
+    # out-of-picture reads replicate the edge samples: clamp both ends
+    cx = lambda v: min(max(v, 0), W * 16 - 1)
+    cy = lambda v: min(max(v, 0), H * 16 - 1)
+    x0, x1 = cx(x - 4), cx(x + 3 + 5)
+    y0, y1 = cy(y - 4), cy(y + 3 + 5)
+    return y0 // 16, y1 // 16 + 1, x0 // 16, x1 // 16 + 1
+
+
+class PixelOracle:
+    """Answers whether a changed block's prediction is provably unchanged,
+    from the original decoded pixels of the reference pictures."""
+
+    def __init__(self, frames, poc_of, W, H):
+        self.frames, self.poc_of, self.W, self.H = frames, poc_of, W, H
+        self.eq = {}
+
+    def same(self, a, b, rect):
+        if a == b:
+            return True
+        key = (min(a, b), max(a, b))
+        if key not in self.eq:
+            from .verify import mb_maxdiff
+            m, _ = mb_maxdiff(self.frames[self.poc_of[a]], self.frames[self.poc_of[b]], self.W, self.H)
+            self.eq[key] = m == 0
+        y0, y1, x0, x1 = rect
+        sel = self.eq[key][y0:y1, x0:x1]
+        assert sel.size, rect
+        return bool(sel.all())
+
+    def harmless(self, gx, gy, mo, mn, orig_of_new):
+        W, H = self.W, self.H
+        used = []
+        changed = False
+        for l in range(2):
+            ro = mo.refpic[l][gy][gx]
+            rn = mn.refpic[l][gy][gx]
+            rn = None if rn is None else orig_of_new[rn]
+            if (ro is None) != (rn is None):
+                return False
+            if ro is None:
+                continue
+            mv = mo.mv[l][gy][gx]
+            if mv != mn.mv[l][gy][gx]:
+                return False
+            if ro != rn:
+                changed = True
+                if not self.same(ro, rn, _mb_rect(gx, gy, mv, W, H)):
+                    return False
+            used.append((ro, mv))
+        if changed and len(used) == 2:
+            # implicit bi-prediction weights follow the reference POCs, so the
+            # result is only unchanged if both predictions are identical
+            (r0, mv0), (r1, mv1) = used
+            if mv0 != mv1 or not self.same(r0, r1, _mb_rect(gx, gy, mv0, W, H)):
+                return False
+        return True
 
 
 def run_task(task):
@@ -101,7 +166,7 @@ def run_task(task):
     for d in task['cands']:
         if orig[d]['type'] == 'B':
             need.add(orig[d]['lists'][1][0])
-    parsed, m_orig = {}, {}
+    parsed, m_orig, blocks = {}, {}, {}
     patches, sniff = {}, []
     log_lines = []
     for d in sorted(need):
@@ -121,17 +186,34 @@ def run_task(task):
         m_orig[d] = mo
         parsed[nd] = (dd, mn)
         if d in task['cands'] and t != 'I':
-            ch = changed_mbs(mo, mn, orig_of_new, W, H)
-            sniff.append({'dec': d, 'display': po['disp'], 'type': t, 'mbs': len(ch)})
-            if ch:
-                patches[nd] = sorted(ch)
+            blocks[d] = changed_blocks(mo, mn, orig_of_new, W, H)
     repl, stats = {}, {}
-    if patches:
-        # original pixels of the patched pictures, by POC
-        last = max(orig_of_new[nd] for nd in patches)
+    todo = {d: b for d, b in blocks.items() if b}
+    if todo:
+        # original pixels of the affected pictures and of every picture their
+        # changed blocks read, old and new context
+        refs = set(todo)
+        for d, bl in todo.items():
+            mo, mn = m_orig[d], parsed[new_of[d]][1]
+            for gx, gy in bl:
+                for l in range(2):
+                    if mo.refpic[l][gy][gx] is not None:
+                        refs.add(mo.refpic[l][gy][gx])
+                    if mn.refpic[l][gy][gx] is not None:
+                        refs.add(orig_of_new[mn.refpic[l][gy][gx]])
         first = min(orig)
-        want = {new[nd]['poc'] for nd in patches}
-        frames = decode_pocs(_G['orig_es'], orig, first, last + 1, want, frame_size(sps))
+        poc_of = {d: orig[d]['poc'] for d in orig}
+        frames = decode_pocs(_G['orig_es'], orig, first, max(refs) + 1, {poc_of[d] for d in refs},
+                             frame_size(sps))
+        oracle = PixelOracle(frames, poc_of, W, H)
+        for d, bl in sorted(todo.items()):
+            mo, mn = m_orig[d], parsed[new_of[d]][1]
+            mbs = {(gx // 4, gy // 4) for gx, gy in bl if not oracle.harmless(gx, gy, mo, mn, orig_of_new)}
+            sniff.append({'dec': d, 'display': orig[d]['disp'], 'type': orig[d]['type'],
+                          'changed_blocks': len(bl), 'mbs': len(mbs)})
+            if mbs:
+                patches[new_of[d]] = sorted(mbs)
+    if patches:
         repl = patch_pictures(mm, spss, ppss, new, patches, lambda nd: frames[new[nd]['poc']],
                               log=log_lines.append, parsed=parsed, stats=stats)
     mm.close()

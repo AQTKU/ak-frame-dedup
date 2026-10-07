@@ -190,8 +190,28 @@ def new_lists(spss, pics, drop):
         q['slices'][0]['frame_num'] = (p['slices'][0]['frame_num'] - shift) % max_fn
         shadow.append(q)
     dpb_walk(spss, shadow)
+    by_dec = {p['dec']: p for p in pics}
     out = {}
     for q in shadow:
         out[q['orig']] = [[shadow[i]['orig'] for i in q['lists'][l]] for l in range(2)]
-        assert q['poc'] == pics[q['orig']]['poc']
+        assert q['poc'] == by_dec[q['orig']]['poc']
     return out
+
+
+def free_drop_checker(spss, pics):
+    """Returns free(dec): True when removing picture `dec` (a reference
+    picture) changes no other picture's reference lists in its IDR period,
+    i.e. nothing reads it and the sliding window stays equivalent. Such a
+    drop is bit-exact for every other frame, like a non-reference drop."""
+    periods = {}
+    for p in pics:
+        periods.setdefault(p['period'], []).append(p)
+
+    def free(dec):
+        p = pics[dec]
+        if p['idr']:
+            return False
+        per = periods[p['period']]
+        nl = new_lists(spss, per, {dec})
+        return all(nl[q['dec']] == q['lists'] for q in per if q['dec'] != dec)
+    return free

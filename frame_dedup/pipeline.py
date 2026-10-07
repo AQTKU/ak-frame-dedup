@@ -13,7 +13,7 @@ from .evidence import black_runs, evidence, load_model, proxy_features, static_m
 from .mux import duration_check, mux
 from .plan import choose_drops, offsets, sync_correct, sync_stats
 from .repair import repair
-from .stream import Unsupported, extract_annexb, input_rate, load, write_stream
+from .stream import Unsupported, extract_annexb, free_drop_checker, input_rate, load, write_stream
 from .system import Logger, peak_rss, physical_ram
 from .verify import verify
 
@@ -118,6 +118,7 @@ class Run:
 
         fps_out = SOURCE_RATES[best['source']]
         self.fps_out, self.best, self.segs, self.black, self.dup = fps_out, best, segs, black, dup
+        self.feat = feat
         r = best['r']
         self.log(f'detected source rate {best["source"]} fps (r = {r}), cadence score {score:.2f}')
 
@@ -152,8 +153,11 @@ class Run:
         for p in pics:
             disp[p['disp']] = p
         self.disp = disp
-        drop, hard, unsupported = choose_drops(disp, self.dup)
-        n_nonref = len(drop) - len(hard)
+        drop, hard, unsupported, freed, subs = choose_drops(disp, self.dup, free_drop_checker(self.spss, pics),
+                                                            self.feat['mad'], self.feat['bmax'],
+                                                            visible_subs=not getattr(self.a, 'keep_idr_pairs', False))
+        n_planned = len(drop)
+        n_nonref = len(drop) - len(hard) - len(freed) - len(subs)
         events = [c['display'] for c in self.report['cadence']['phase_changes'] if c['at'] == 'cut']
         events += [u['display'] for u in unsupported]
         drop, corrections = sync_correct(disp, drop, self.best['r'], self.black, events)
@@ -174,12 +178,18 @@ class Run:
                                   'max_abs_offset_frames': round(float(np.nanmax(np.abs(seg))), 3)})
         st['chunks'] = chunk_off
         self.report['drops'] = {'total': len(drop), 'duplicates': int(self.dup.sum()),
-                                'non_reference': n_nonref, 'hard': len(hard),
-                                'sync_net_change': len(drop) - n_nonref - len(hard)}
+                                'non_reference': n_nonref, 'unreferenced_reference': len(freed),
+                                'substitute_invisible': sum(1 for x in subs if not x['visible']),
+                                'substitute_visible': sum(1 for x in subs if x['visible']),
+                                'hard': len(hard), 'sync_net_change': len(drop) - n_planned}
+        self.report['unreferenced_reference_drops'] = freed
+        self.report['substitute_drops'] = subs
         self.report['hard_pairs'] = hard
         self.report['unsupported_pairs'] = unsupported
         self.report['sync'] = {'corrections': corrections, **st}
-        self.log(f'dropping {len(drop)} pictures ({len(hard)} hard pairs, {len(unsupported)} unsupported pairs, '
+        self.log(f'dropping {len(drop)} pictures ({len(freed)} unreferenced reference twins, '
+                 f'{len(subs)} substitutes ({sum(1 for x in subs if x["visible"])} visible), {len(hard)} hard pairs, '
+                 f'{len(unsupported)} unsupported pairs, '
                  f'{len(corrections)} sync corrections); output {N - len(drop)} frames, '
                  f'final A/V offset {st["final_offset_frames"]} frames, max {st["max_abs_offset_ms"]} ms')
         self.stage('plan', t)
