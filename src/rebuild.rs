@@ -45,6 +45,29 @@ pub const MAX_ROUNDS: usize = 4;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// Apply `rebuilds` (decode indices of the stream `src_es`, parsed as
+/// `src_pics`; `orig_of_src` maps them to the original stream's) and write
+/// `out_path`. Returns (the original decode index of every output picture in
+/// output decode order, the report's `anchor_rebuilds` section with Python's
+/// keys). Python: `rebuild.rebuild`.
+#[allow(clippy::too_many_arguments)]
+pub fn rebuild(
+    _orig_es: &Path,
+    _src_es: &Path,
+    _out_path: &Path,
+    _spss: &Spss,
+    _ppss: &Ppss,
+    _orig_pics: &[Picture],
+    _src_pics: &[Picture],
+    _orig_of_src: &[usize],
+    _rebuilds: &[Rebuild],
+    _workers: usize,
+    _work: &Path,
+    _log: &crate::system::Logger,
+) -> Result<(Vec<usize>, serde_json::Value)> {
+    todo!("port rebuild.rebuild (B1-B3 re-encoding and the parallel driver)")
+}
+
 /// A planned rebuild (Python: `{'K', 'D', 'B'}`): K the dropped P, D the IDR
 /// that takes its place, `b` the leading pictures that read K (decode
 /// indices in the stream the rebuild is planned on).
