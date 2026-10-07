@@ -14,7 +14,8 @@ from .mux import duration_check, mux
 from .plan import choose_drops, offsets, sync_correct, sync_stats
 from .rebuild import candidate, rebuild
 from .repair import repair
-from .stream import Unsupported, extract_annexb, free_drop_checker, input_rate, load, write_stream
+from .stream import Unsupported, extract_annexb, free_drop_checker, input_rate, load, write_explicit, write_stream
+from . import explicit as X
 from .system import Logger, peak_rss, physical_ram
 from .verify import verify
 
@@ -61,8 +62,13 @@ class Run:
                                      'num_units_in_tick': spss[0]['vui']['timing']['num_units_in_tick'],
                                      'time_scale': spss[0]['vui']['timing']['time_scale']}
         self.report['frames_in'] = N
+        self.explicit = X.stream_is_explicit(pics)
+        self.report['explicit_reference_control'] = self.explicit
         self.log(f'{N} pictures, input rate {_fps_str(fps_in)} fps ({fps_in}) from the SPS VUI, '
                  f'{sum(p["idr"] for p in pics)} IDR periods')
+        if self.explicit:
+            self.log('the stream uses MMCO / reference list modification: headers will be rewritten with '
+                     'explicit reference control')
         if in_name is None:
             raise Unsupported(f'input rate {_fps_str(fps_in)} fps is not 29.97 or 30; nothing to do')
         self.fps_in = fps_in
@@ -155,14 +161,17 @@ class Run:
             disp[p['disp']] = p
         self.disp = disp
         rebuildable = None
+        cand = X.candidate if self.explicit else candidate
         if not getattr(self.a, 'no_rebuild', False):
             periods = {}
             for p in pics:
                 periods.setdefault(p['period'], []).append(p)
-            rebuildable = lambda K, D: candidate(self.spss, pics, periods, K, D)
+            rebuildable = lambda K, D: cand(self.spss, pics, periods, K, D)
+        free = X.free_checker(pics) if self.explicit else free_drop_checker(self.spss, pics)
         drop, hard, unsupported, freed, subs, rebuilds = choose_drops(
-            disp, self.dup, free_drop_checker(self.spss, pics), self.feat['mad'], self.feat['bmax'],
-            visible_subs=not getattr(self.a, 'keep_idr_pairs', False), rebuildable=rebuildable)
+            disp, self.dup, free, self.feat['mad'], self.feat['bmax'],
+            visible_subs=not getattr(self.a, 'keep_idr_pairs', False), rebuildable=rebuildable,
+            explicit=self.explicit)
         fallbacks = [r for r in rebuilds if 'fallback' in r]
         rebuilds = [r for r in rebuilds if 'fallback' not in r]
         n_planned = len(drop)
@@ -181,6 +190,7 @@ class Run:
         self.drop = drop
         self.hard = hard
         self.rebuilds = rebuilds
+        self.freed = [f for f in freed if f['display'] in drop]
         st = sync_stats(N, drop, self.best['r'], float(self.fps_out))
         off = offsets(N, drop, self.best['r'])
         chunk_off = []
@@ -212,6 +222,8 @@ class Run:
 
     # ------------------------------------------------------------------
     def write(self):
+        if self.explicit:
+            return self.write_explicit()
         a = self.a
         fo = self.fps_out
         timing = (fo.denominator, 2 * fo.numerator)
@@ -258,6 +270,59 @@ class Run:
             self.stage('rebuild', t)
         self.out_es = out_es
 
+    def write_explicit(self):
+        """Streams with MMCO / list modification: one header plan for every
+        drop and anchor rebuild (explicit.py), then the measured repair."""
+        a = self.a
+        fo = self.fps_out
+        timing = (fo.denominator, 2 * fo.numerator)
+        t = time.time()
+        pics = self.pics
+        drop_dec = {self.disp[i]['dec'] for i in self.drop}
+        rbs = [(r['K_dec'], r['D_dec']) for r in self.rebuilds]
+        rb_K = {K for K, _ in rbs}
+        sigma = {}
+        for f in self.freed:
+            sigma[f['dec']] = f['sigma']
+        for h in self.hard:
+            sigma[h['dropped_dec']] = h['kept_dec']
+        for d in drop_dec - rb_K:
+            if pics[d]['ref_idc'] and d not in sigma:
+                sigma[d] = None   # an unreferenced reference picture (e.g. a substitute)
+        entries, hdrs = X.plan_stream(self.spss, pics, drop_dec - rb_K, sigma, rbs)
+        stage1 = os.path.join(a.work, 'dedup.h264')
+        n_rw, n_sps = write_explicit(self.es, pics, self.spss, self.ppss, stage1, entries, hdrs, timing)
+        self.orig_of_out = [e['pic']['dec'] for e in entries]
+        self.report['sps_timing'] = {'num_units_in_tick': timing[0], 'time_scale': timing[1], 'sps_patched': n_sps}
+        self.log(f'wrote {stage1}: {n_rw} slice headers rewritten (explicit reference control), '
+                 f'{len(rbs)} IDRs demoted for anchor rebuilds, {n_sps} SPS timing patched to {timing[0]}/{timing[1]}')
+        self.stage('write_dedup', t)
+        out_es = stage1
+        rep = {'pictures_rewritten': 0, 'pcm_mbs': 0, 'bytes_added': 0}
+        nspss, nppss, npics = load(stage1)
+        # the written stream must parse to the planned lists and POCs
+        assert len(npics) == len(entries)
+        for q, e, h in zip(npics, entries, hdrs):
+            assert q['poc'] == e['poc'] and q['idr'] == e['idr'], q['dec']
+            assert [[self.orig_of_out[i] for i in l] for l in q['lists']] == h['lists'], q['dec']
+        if any(v is not None for v in sigma.values()) or rbs:
+            t = time.time()
+            for K, D in rbs:
+                sigma[K] = D
+            repl, rep = repair(self.es, stage1, self.spss, self.ppss, pics, npics, drop_dec, a.workers,
+                               log=self.log, sigma=sigma, work=a.work, orig_of_out=self.orig_of_out)
+            if repl:
+                out_es = os.path.join(a.work, 'out.h264')
+                write_stream(stage1, npics, nspss, out_es, repl=repl)
+            self.log(f"repair: {rep['pictures_rewritten']} pictures rewritten, {rep['pcm_mbs']} PCM MBs, "
+                     f"{rep['bytes_added']:+d} bytes; {rep.get('pictures_over_threshold_after', 0)} pictures still "
+                     f"over the drift threshold, worst {rep.get('worst_after', 0)}")
+            self.stage('repair', t)
+        self.report['repair'] = rep
+        self.report['anchor_rebuilds'] = {'pairs': len(rbs), 'leading_pictures': sum(len(r['B_dec']) for r in self.rebuilds),
+                                          'pairs_detail': self.rebuilds}
+        self.out_es = out_es
+
     # ------------------------------------------------------------------
     def remux(self):
         a = self.a
@@ -293,7 +358,11 @@ class Run:
             period_end[p['period']] = max(period_end.get(p['period'], -1), p['disp'])
         for h in self.hard:
             D = self.pics[h['dropped_dec']]
-            hood.update(range(D['disp'] + 1, period_end[D['period']] + 1))
+            if self.explicit:
+                # every later picture in decode order of D's period can read it
+                hood.update(p['disp'] for p in self.pics if p['period'] == D['period'] and p['dec'] > D['dec'])
+            else:
+                hood.update(range(D['disp'] + 1, period_end[D['period']] + 1))
         # leading B pictures of rebuilt pairs (they read I2 where they read K)
         lead = {self.pics[b]['disp'] for r in self.rebuilds for b in r['B_dec']} - set(self.drop)
         in_lead = [d for d in res['differing_frames'] if d['display'] in lead]

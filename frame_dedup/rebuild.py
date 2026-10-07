@@ -35,14 +35,13 @@ import os
 import time
 
 from .decode import decode_pocs, frame_size, iter_frames
-from .h264cabac import B_TYPES
 from .h264hdr import escape, parse_slice, set_bits, unescape
 from .h264mv import Motion, derive_motion, dpb_walk
 from .patch import fix_qp, pcm_record, qp_chain, same_motion
 from .roundtrip_test import decode_picture, encode_picture, from_bits, to_bits
 from .system import REPAIR_PEAK, lower_priority, peak_rss, pool_size
 from .verify import mb_maxdiff
-from .verify_motion import reexpress
+from .verify_motion import has_direct as _has_direct, reexpress_compact
 
 # sei_message: payloadType 6 (recovery point), payloadSize 1,
 # recovery_frame_cnt ue 0 ('1'), exact_match 1, broken_link 0,
@@ -262,46 +261,6 @@ def write_rebuilt(src_es, pics, spss, ppss, out_path, rebuilds, repl=None):
 
 
 # ---------------------------------------------------------------- B1-B3
-
-def reexpress_compact(mb, motion):
-    """An explicit B macroblock record carrying `motion` for a B_Skip /
-    B_Direct_16x16 MB (or a B_8x8 MB with direct sub-blocks), using the
-    coarsest partitioning that fits: direct motion is uniform per 8x8
-    quadrant (direct_8x8_inference), so 16x16, 16x8 or 8x16 often suffice
-    and cost far fewer mvds than 8x8. mvds are left for derive_motion's
-    target mode to solve."""
-    if mb.get('part') == '8x8' and not mb['skip']:
-        return reexpress(mb, 'B', motion)
-    x0, y0 = mb['x'] * 4, mb['y'] * 4
-
-    def quad(i):
-        gx, gy = x0 + (i % 2) * 2, y0 + (i // 2) * 2
-        return tuple((motion.refidx[l][gy][gx], motion.mv[l][gy][gx] if motion.refidx[l][gy][gx] >= 0 else None)
-                     for l in range(2))
-    q = [quad(i) for i in range(4)]
-    if q[0] == q[1] == q[2] == q[3]:
-        part, groups = '16x16', [q[0]]
-    elif q[0] == q[1] and q[2] == q[3]:
-        part, groups = '16x8', [q[0], q[2]]
-    elif q[0] == q[2] and q[1] == q[3]:
-        part, groups = '8x16', [q[0], q[1]]
-    else:
-        return reexpress(mb, 'B', motion)
-    preds = tuple('Bi' if g[0][0] >= 0 and g[1][0] >= 0 else ('L0' if g[0][0] >= 0 else 'L1') for g in groups)
-    n = copy.deepcopy(mb)
-    n.update(skip=0, kind='B', part=part, btype=B_TYPES.index((part, preds)), direct16=0)
-    n['refs'] = [[g[l][0] if g[l][0] >= 0 else None for g in groups] for l in range(2)]
-    n['mvds'] = [[(0, 0) if g[l][0] >= 0 else None for g in groups] for l in range(2)]
-    n.pop('sub', None)
-    if mb['skip']:
-        n.update(cbp=0, t8=0, qpd=0, coef={})
-    return n
-
-
-def _has_direct(mb):
-    return not mb['intra'] and (mb['skip'] or mb.get('part') == 'D' or
-                                (mb.get('part') == '8x8' and 0 in mb['sub']))
-
 
 def _intra_motion(W, H):
     m = Motion(W, H)

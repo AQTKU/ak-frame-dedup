@@ -4,8 +4,12 @@ import re
 import subprocess
 
 from .h264hdr import escape, parse_stream, patch_sps_timing, set_bits, sps_frame_rate, unescape
+from .explicit import rewrite_slice
 from .h264mv import dpb_walk
 from .system import popen_kwargs
+
+
+START_CODE = bytes((0, 0, 0, 1))
 
 
 class Unsupported(Exception):
@@ -39,7 +43,10 @@ def load(es_path):
     if not pics:
         raise Unsupported('no pictures in the video stream')
     check_scope(spss, ppss, pics)
-    dpb_walk(spss, pics)
+    try:
+        dpb_walk(spss, pics)
+    except ValueError as e:
+        raise Unsupported(str(e))
     period = -1
     for p in pics:
         if p['idr']:
@@ -75,8 +82,6 @@ def check_scope(spss, ppss, pics):
         raise Unsupported(f'{multi} pictures have more than one slice; only one slice per picture is supported')
     for p in pics:
         sl = p['slices'][0]
-        if sl['mmco'] or sl['rplm'][0] or sl['rplm'][1]:
-            raise Unsupported('streams with MMCO or ref list modification are not supported')
         if sl.get('long_term_ref'):
             raise Unsupported('long-term references are not supported')
 
@@ -103,12 +108,93 @@ def _nals(buf):
     return out
 
 
-def write_stream(es_path, pics, spss, out_path, drop=(), repl=None, timing=None):
+def _write_head(o, head, timing, sps_cache):
+    """Write the non-VCL NALs in front of a picture, with every SPS's VUI
+    timing patched to `timing`. Returns the number of SPSs patched."""
+    if timing is None or not head:
+        o.write(head)
+        return 0
+    pos = n = 0
+    for sc, s, e in _nals(head):
+        if head[s] & 0x1f == 7:
+            nal = bytes(head[s:e])
+            if nal not in sps_cache:
+                sps_cache[nal] = patch_sps_timing(nal, *timing)
+            o.write(head[pos:s])
+            o.write(sps_cache[nal])
+            pos = e
+            n += 1
+    o.write(head[pos:])
+    return n
+
+
+def write_explicit(es_path, pics, spss, ppss, out_path, entries, hdrs, timing=None):
+    """Write the stream planned by explicit.plan_stream: pictures not in
+    `entries` are dropped (their non-VCL NALs ride along with the next
+    picture), headers that changed are rewritten, and a demoted IDR (anchor
+    rebuild "I2") is written in K's slot behind K's and its own non-VCL NALs
+    and a recovery point SEI. Returns (rewritten slices, SPSs patched)."""
+    from .rebuild import RECOVERY_SEI
+    at = {}
+    i2_at = {}
+    for e, h in zip(entries, hdrs):
+        if e.get('demote'):
+            i2_at[e['as']['dec']] = (e['pic'], h)
+        else:
+            at[e['pic']['dec']] = h
+    moved = {D['dec'] for D, _ in i2_at.values()}
+    n_rw = n_sps = 0
+    sps_cache = {}
+
+    def first_sc(mm, sl):
+        first = sl['offset'] - 3
+        if mm[first - 1] == 0:
+            first -= 1
+        return first
+
+    with open(es_path, 'rb') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        with open(out_path, 'wb', buffering=1 << 22) as o:
+            for p in pics:
+                sl = p['slices'][0]
+                first = first_sc(mm, sl)
+                end = sl['offset'] + sl['size']
+                if p['dec'] in moved:          # written in K's slot
+                    o.write(mm[end:p['au_end']])
+                    continue
+                n_sps += _write_head(o, mm[p['au_start']:first], timing, sps_cache)
+                if p['dec'] in i2_at:
+                    D, h = i2_at[p['dec']]
+                    dsl = D['slices'][0]
+                    n_sps += _write_head(o, mm[D['au_start']:first_sc(mm, dsl)], timing, sps_cache)
+                    o.write(START_CODE + RECOVERY_SEI)
+                    o.write(START_CODE + rewrite_slice(mm[dsl['offset']:dsl['offset'] + dsl['size']], dsl,
+                                                                spss, ppss, h))
+                    n_rw += 1
+                    o.write(mm[end:p['au_end']])
+                    continue
+                if p['dec'] not in at:         # dropped
+                    o.write(mm[end:p['au_end']])
+                    continue
+                h = at[p['dec']]
+                if h['same']:
+                    o.write(mm[first:end])
+                else:
+                    o.write(START_CODE + rewrite_slice(mm[sl['offset']:end], sl, spss, ppss, h))
+                    n_rw += 1
+                o.write(mm[end:p['au_end']])
+        mm.close()
+    return n_rw, n_sps
+
+
+def write_stream(es_path, pics, spss, out_path, drop=(), repl=None, timing=None, hdrs=None, ppss=None):
     """Write a copy of the stream with pictures in `drop` (decode indices)
     removed, frame_num renumbered after dropped reference pictures (up to the
     next IDR), NALs in `repl` ({dec: nal bytes}) substituted, and every SPS's
     VUI timing set to `timing` = (num_units_in_tick, time_scale).
-    Returns the number of renumbered slices and SPSs patched."""
+    With `hdrs` ({dec: header plan from explicit.plan}, explicit mode) the
+    slice headers named there are rewritten instead of renumbered.
+    Returns the number of rewritten slices and SPSs patched."""
     drop = set(drop)
     repl = repl or {}
     log2_fn = spss[0]['log2_max_frame_num']
@@ -127,21 +213,7 @@ def write_stream(es_path, pics, spss, out_path, drop=(), repl=None, timing=None)
                 if mm[first - 1] == 0:
                     first -= 1
                 # non-VCL NALs in front of the picture (SPS/PPS/AUD/SEI) ride along
-                head = mm[p['au_start']:first]
-                if timing is not None and head:
-                    pos = 0
-                    for sc, s, e in _nals(head):
-                        if head[s] & 0x1f == 7:
-                            nal = bytes(head[s:e])
-                            if nal not in sps_cache:
-                                sps_cache[nal] = patch_sps_timing(nal, *timing)
-                            o.write(head[pos:s])
-                            o.write(sps_cache[nal])
-                            pos = e
-                            n_sps += 1
-                    o.write(head[pos:])
-                else:
-                    o.write(head)
+                n_sps += _write_head(o, mm[p['au_start']:first], timing, sps_cache)
                 end = sl['offset'] + sl['size']
                 if p['dec'] in drop:
                     if p['ref_idc']:
@@ -154,7 +226,11 @@ def write_stream(es_path, pics, spss, out_path, drop=(), repl=None, timing=None)
                 else:
                     o.write(mm[first:sl['offset']])
                     nal = mm[sl['offset']:end]
-                if shift:
+                if hdrs is not None:
+                    if p['dec'] in hdrs:
+                        nal = rewrite_slice(nal, sl, spss, ppss, hdrs[p['dec']])
+                        n_renum += 1
+                elif shift:
                     rbsp = bytearray(unescape(bytes(nal[1:])))
                     set_bits(rbsp, sl['frame_num_bit'], log2_fn, (sl['frame_num'] - shift) % max_fn)
                     nal = bytes(nal[:1]) + escape(bytes(rbsp))

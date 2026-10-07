@@ -251,8 +251,9 @@ def parse_slice(rbsp, nal_type, nal_ref_idc, spss, ppss):
         h['num_ref_l1'] = 0
     if t in ('I', 'SI'):
         h['num_ref_l0'] = 0
-    # ref_pic_list_modification
+    # ref_pic_list_modification, spanning [rplm_bit, rplm_end_bit)
     h['rplm'] = [[], []]
+    h['rplm_bit'] = b.p
     for lst in (0, 1):
         if (lst == 0 and t not in ('I', 'SI')) or (lst == 1 and t == 'B'):
             if b.u(1):
@@ -261,6 +262,7 @@ def parse_slice(rbsp, nal_type, nal_ref_idc, spss, ppss):
                     if idc == 3:
                         break
                     h['rplm'][lst].append((idc, b.ue()))
+    h['rplm_end_bit'] = b.p
     # pred_weight_table
     h['weighted'] = False
     if (pps['weighted_pred'] and t in ('P', 'SP')) or (pps['weighted_bipred_idc'] == 1 and t == 'B'):
@@ -282,6 +284,7 @@ def parse_slice(rbsp, nal_type, nal_ref_idc, spss, ppss):
             h['no_output_prior'] = b.u(1)
             h['long_term_ref'] = b.u(1)
         elif b.u(1):
+            h['adaptive'] = 1
             while True:
                 op = b.ue()
                 if op == 0:

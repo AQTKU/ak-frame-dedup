@@ -249,6 +249,71 @@ Dev tools:
       runs from the dropped twin to the end of its IDR period. The leading B
       pictures are reported separately (`verify.rebuild_leading_b`).
 
+### Explicit mode (MMCO / reference list modification)
+
+Some encoders, such as x264 with B-pyramid and weighted P prediction
+(mmco-or-ref-list-modification.mkv, an Amazon encode), manage references
+explicitly:
+- reference B pictures unmark older pictures with MMCO 1;
+- every P picture reorders its list with ref_pic_list_modification, and
+  lists the same picture two or three times so that each entry can carry
+  different explicit weights.
+
+Renumbering frame_num after a dropped reference breaks such a stream. The
+picNum differences in later headers count the dropped picture, and its own
+MMCOs never run. When the input uses either feature anywhere, the tool
+switches to explicit mode (`explicit.py`):
+
+- **Header planning.** For every kept picture, the decoder must see exactly
+  its original reference lists, entry by entry, and after marking exactly
+  its original set of short-term references. A dropped twin D is replaced
+  in both by its substitute σ(D), the other twin K. The planner simulates
+  the DPB of the new stream and writes:
+  - ref_pic_list_modification commands: the original ones if they still
+    produce the list, none if the default list already does, else the
+    shortest explicit prefix;
+  - MMCO 1 operations: sliding window if it gives the target set, else
+    explicit unmarking.
+
+  frame_num is renumbered without gaps. The plan is re-simulated with
+  `dpb_walk`, and the written stream is re-parsed and compared with it.
+  Reference indices keep their meaning, so explicit weight tables, spatial
+  direct reference indices and every block that does not read D stay
+  valid. Planning an unmodified stream reproduces every header bit for bit.
+- **Header rewriting.** Slice headers are re-serialised bit by bit:
+  frame_num, POC lsb, ref_pic_list_modification, dec_ref_pic_marking, and
+  IDR demotion. The CABAC slice data is byte-aligned and is appended
+  unchanged.
+- **Drop rules.** K must be decoded before D, so the twin later in decode
+  order is dropped. It is *free* (bit-exact) when no list names it. The
+  earlier twin is dropped instead only if nothing reads it. When the later
+  twin is an IDR, the anchor rebuild is planned the same way: D is demoted
+  into K's slot as I2, its period merges into K's with shifted POCs, and
+  explicit MMCOs unmark K's period at the first reference picture after
+  the leading pictures. Leading reference B pictures are fine here, unlike
+  in `rebuild.py`.
+- **Spatial direct.** `derive_motion` derives spatial direct (MinPositive
+  reference indices, colZero). Re-expressing every inter MB of 30 pictures
+  as explicit motion decodes bit-identically. B pictures whose co-located
+  picture became K are re-encoded with their original motion (direct
+  blocks made explicit).
+- **Measured repair.** This encoder codes the duplicate twin with its own
+  residual, so D and K differ by encode noise almost everywhere (luma MAD
+  0.5-1.2). Exact repair would PCM nearly every block that reads D: 78,020
+  MBs (+30 MB) for 12 drops. Instead, each IDR period of the new stream that
+  reads a substitute is decoded and compared with the original over the
+  visible (cropped) area. Macroblocks off by `DRIFT_THRESHOLD` (16) or more
+  become I_PCM copies of the original, in decode order up to the first
+  reference picture, since that also fixes what is predicted from it. The
+  period is then decoded again, until nothing crosses the threshold. At most
+  `DRIFT_MAX_FRACTION` (2%, 163 MBs at 1080p) of a picture is patched.
+  After `DRIFT_SEQUENTIAL_ROUNDS` (6) rounds, every picture still over the
+  threshold is patched in the same round. This matters because anchor
+  rebuilds chain: with an IDR every 60 frames, a whole phase segment of
+  IDRs falls on duplicates, and up to 18 periods merge into one.
+- **Verify** treats every picture of D's IDR period decoded after D as its
+  neighbourhood (here D can be the display-earlier twin).
+
 ### Modules
 
 | module | role |
@@ -258,6 +323,7 @@ Dev tools:
 | `h264mv.py` | `dpb_walk` (POC, sliding-window ref lists) and `derive_motion` (P_Skip, temporal direct, mvd solving) |
 | `patch.py` | I_PCM macroblock patcher that keeps the rest of the picture exact (`patch_pictures` runs on a subset in a worker) |
 | `rebuild.py` | anchor rebuild: IDR demotion, period merging, list check, B1-B3 repair, recovery point SEI |
+| `explicit.py` | explicit mode: header planning (ref_pic_list_modification + MMCO 1), slice header rewriting, explicit anchor rebuilds |
 | `roundtrip_test.py`, `verify_motion.py` | CABAC round trip; motion re-expression test |
 | `evidence.py`, `cadence.py`, `plan.py` | detection and drop planning |
 | `stream.py`, `repair.py`, `decode.py`, `verify.py`, `mux.py`, `pipeline.py`, `__main__.py` | the pipeline |
@@ -273,6 +339,11 @@ ffmpeg decoders once crashed a machine with marginal RAM.
 - Memory-heavy pools are sized so that workers × budget stays under 40% of
   physical RAM. The budget is 0.8 GB per repair worker and 0.5 GB per
   verify worker; measured peaks were 0.18-0.34 GB.
+- An explicit-mode repair worker has a budget of 1.5 GB (9 workers on
+  31.7 GB). It holds at most `PARSED_CAP` parsed pictures and compact
+  co-located motion fields. It decodes the original again each round
+  instead of keeping it, and it keeps only the PCM samples of the MBs it
+  patches. The peak was 1.0 GB on an 864-picture merged period.
 - Each worker runs at most one full-resolution ffmpeg decoder, with 2
   threads. Verify hashes the original, then compares the output, then
   re-decodes only for frames that differ. It uses half the workers,
@@ -325,6 +396,36 @@ default settings:
 
 System load during these runs: CPU peaked at 80-84% (mean 51-68%), and
 available RAM never dropped below 13.3 GB of 31.7 GB.
+
+### mmco-or-ref-list-modification.mkv (explicit mode, v1.2.0)
+
+An 84-minute Amazon x264 encode: B-pyramid with MMCO, ref list modification
+and weighted P prediction, spatial direct, and an IDR every 60 frames. It
+was run with `--verify` and default settings.
+
+| | |
+|---|---|
+| input rate / detected source rate | 29.97 / 23.976, score 9.60 |
+| frames in → out | 150,499 → 120,401 |
+| chunks / phase changes | 9 / 10 (8 at black runs, 2 at hard cuts) |
+| drops | 30,098, of which 88% are non-reference B pictures (bit-exact) |
+| unreferenced reference twins dropped (bit-exact) | 382 |
+| hard pairs (measured repair) | 2,716 |
+| anchor rebuilds (fallbacks) | 423 (0). They chain: up to 18 IDR periods merge into one. |
+| substitutes (invisible / visible) | 13 / 0 |
+| slice headers rewritten | 60,319 |
+| repair | 149,483 PCM MBs, +56.2 MB (1.0%) |
+| pictures left over the drift threshold | 291, all at the 2% PCM cap; visible worst 56 |
+| verify: bit-exact / differing frames | 73,476 / 46,925. The differing frames are noise-level drift, all inside hard-drop neighbourhoods and rebuilt leading pictures. |
+| differing anywhere else / decoder errors | 0 / 0 |
+| output size | 5.59 GB (input 6.04 GB) |
+| video − audio duration change | +0.076 s. Two phase changes at hard cuts in the last 3 minutes have no black run after them. |
+| runtime | 94 min (repair 79 min on 9 workers, verify 14 min) |
+
+On a 5-minute clip of the same file (154 hard pairs), the frames that
+differ have a median frame MAD of 0.11. Their median worst pixel is 9, and
+the 99.9th-percentile pixel error has a median of 3. Only 48 MBs are off by
+32 or more.
 
 Seeking on smoke.mkv's output: it has 883 keyframes, one per original IDR
 period (583 IDRs and 300 rebuilt I2s; version 1.0 also had 883, and
@@ -405,9 +506,14 @@ given only the raw output stream with no `--default-duration`, infers
 ## Limitations
 
 - Scope: High/Main profile, 4:2:0, 8-bit, progressive, CABAC, one slice
-  per picture, POC type 0, one SPS id, no MMCO, ref-list modification or
-  long-term references. Anything else exits with code 3. Only 29.97 and
+  per picture, POC type 0, one SPS id, no long-term references. MMCO 1 and
+  short-term ref-list modification are supported (explicit mode); other
+  MMCO operations are not. Anything else exits with code 3. Only 29.97 and
   30 fps inputs are processed.
+- Explicit mode repairs by measurement, not exactly: frames that read a
+  dropped twin keep encode-noise-level differences (below
+  `DRIFT_THRESHOLD`, or above it where the per-picture PCM budget ran out)
+  until the next IDR. See "Explicit mode" above.
 - Hard drops leave differences of 1-8 levels around the I_PCM patches.
   They come from deblocking across PCM edges, and from intra prediction and
   later references that read post-deblock PCM pixels. They cannot be

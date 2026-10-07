@@ -32,7 +32,7 @@ INVISIBLE_MAD = 0.25      # proxy mean / block-max difference below which a fram
 INVISIBLE_BMAX = 1.0      # a visually lossless repeat of its predecessor
 
 
-def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True, rebuildable=None):
+def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True, rebuildable=None, explicit=False):
     """disp: pictures in display order; dup: bool per display index;
     free(dec) -> bool tells whether dropping a reference picture leaves all
     other reference lists unchanged; mad / bmax: proxy differences of each
@@ -41,7 +41,15 @@ def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True, r
     IDR.
     Returns (drop set of display indices, hard list, unsupported list,
     free-reference drops list, substitutes list, rebuilds list). A rebuild
-    entry records the pair and why it fell back if it did ('fallback')."""
+    entry records the pair and why it fell back if it did ('fallback').
+
+    explicit: the stream's headers are rewritten with explicit reference
+    control (explicit.py). A reference twin can then only be replaced by a
+    twin decoded before it, so the twin later in decode order is the one
+    dropped (its substitute is the other: 'kept_dec'); a free twin earlier in
+    decode order is dropped with no substitute ('sigma' None); and when the
+    twin later in decode order is an IDR, the pair goes to the anchor
+    rebuild."""
     N = len(disp)
     drop, hard, unsupported, freed, subs, rebuilds = set(), [], [], [], [], []
     twins = set()
@@ -76,6 +84,45 @@ def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True, r
             drop.add(n)
         elif not a['ref_idc']:
             drop.add(n - 1)
+        elif explicit:
+            # by decode order: L is decoded after E
+            (L, li), (E, ei) = sorted(((a, n - 1), (b, n)), key=lambda x: -x[0]['dec'])
+            if not L['idr'] and free(L['dec']):
+                drop.add(li)
+                freed.append({'display': li, 'twin': 'later' if li == n else 'earlier', 'types': types,
+                              'dec': L['dec'], 'sigma': E['dec']})
+                continue
+            if not E['idr'] and free(E['dec']):
+                drop.add(ei)
+                freed.append({'display': ei, 'twin': 'later' if ei == n else 'earlier', 'types': types,
+                              'dec': E['dec'], 'sigma': None})
+                continue
+            s = substitute(n, invisible=True)
+            if s is not None:
+                drop.add(s)
+                subs.append({'pair': n, 'display': s, 'visible': False, 'mad': round(float(mad[s]), 3),
+                             'types': types})
+            elif not L['idr']:
+                drop.add(li)
+                hard.append({'kept_display': ei, 'dropped_display': li, 'kept_dec': E['dec'],
+                             'dropped_dec': L['dec'], 'types': types})
+            else:
+                rb, why = rebuildable(E['dec'], L['dec']) if rebuildable else (None, None)
+                if rb is not None:
+                    drop.add(ei)
+                    rebuilds.append({'pair': n, 'dropped_display': ei, 'kept_display': li, 'types': types,
+                                     'K_dec': E['dec'], 'D_dec': L['dec'], 'B_dec': rb['B']})
+                    continue
+                if rebuildable:
+                    rebuilds.append({'pair': n, 'types': types, 'fallback': why})
+                s = substitute(n, invisible=False) if visible_subs else None
+                if s is not None:
+                    drop.add(s)
+                    subs.append({'pair': n, 'display': s, 'visible': True, 'mad': round(float(mad[s]), 3),
+                                 'types': types})
+                else:
+                    unsupported.append({'display': n, 'reason': 'later twin is an IDR and no substitute',
+                                        'types': types})
         elif free and free(b['dec']):
             drop.add(n)
             freed.append({'display': n, 'twin': 'later', 'types': types})

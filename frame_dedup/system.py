@@ -18,6 +18,7 @@ BELOW_NORMAL = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
 FFMPEG_THREADS = 2          # threads per full-res decoder when many run at once
 RAM_FRACTION = 0.40         # budget for a pool: workers x peak <= this x physical RAM
 REPAIR_PEAK = 0.8e9         # budget per repair worker (measured peak ~240 MB on sample.mkv)
+REPAIR_PEAK_EXPLICIT = 1.5e9  # explicit-mode repair worker (holds a whole IDR period's frames)
 VERIFY_PEAK = 0.5e9         # budget per verify worker (measured peak ~235 MB)
 
 
