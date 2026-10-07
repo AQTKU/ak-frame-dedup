@@ -2,6 +2,8 @@
 import subprocess
 import threading
 
+from .system import FFMPEG_THREADS, popen_kwargs
+
 
 def frame_size(sps):
     return sps['mb_w'] * 16 * sps['mb_h'] * 16 * 3 // 2
@@ -24,14 +26,14 @@ def _feed(proc, path, ranges):
         pass
 
 
-def iter_frames(path, ranges, fs, threads=2):
+def iter_frames(path, ranges, fs, threads=FFMPEG_THREADS):
     """Decode the concatenated byte ranges of an Annex-B file (they must start
     at an IDR access unit) and yield uncropped yuv420p frames in output order.
     Raises RuntimeError on decoder errors."""
     cmd = ['ffmpeg', '-v', 'error', '-threads', str(threads), '-apply_cropping', 'none', '-f', 'h264',
            '-i', '-', '-fps_mode', 'passthrough', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', '-']
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         bufsize=fs * 2)
+                         bufsize=fs * 2, **popen_kwargs())
     t = threading.Thread(target=_feed, args=(p, path, ranges), daemon=True)
     t.start()
     err = []
@@ -53,7 +55,7 @@ def iter_frames(path, ranges, fs, threads=2):
         raise RuntimeError(f'decoder error on {path}: {msg[:500]}')
 
 
-def decode_pocs(path, pics, a, b, want, fs, threads=2):
+def decode_pocs(path, pics, a, b, want, fs, threads=FFMPEG_THREADS):
     """Decode pictures [a, b) (decode order; a must be an IDR, all in one IDR
     period) and return {poc: frame} for the POCs in `want`."""
     pocs = sorted(pics[d]['poc'] for d in range(a, b))

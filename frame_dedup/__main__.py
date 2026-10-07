@@ -4,6 +4,7 @@ import os
 import sys
 
 from .pipeline import run
+from .system import default_workers, lower_priority
 
 
 def main(argv=None):
@@ -18,9 +19,13 @@ def main(argv=None):
                     help='decode output and original and compare every kept frame by POC')
     ap.add_argument('--work', help='work directory for intermediates (default: work/<input name>)')
     ap.add_argument('--keep-work', action='store_true', help='keep the work directory')
-    ap.add_argument('--workers', type=int, default=os.cpu_count() or 4, help='parallel processes')
+    ap.add_argument('--workers', type=int, default=default_workers(),
+                    help='parallel worker processes (default: half the logical CPUs); memory-heavy '
+                         'stages use fewer if RAM is short')
     ap.add_argument('--dry-run', action='store_true', help='detect and plan only; write no video')
     a = ap.parse_args(argv)
+    lower_priority()
+    a.workers = max(1, a.workers)
     if not a.dry_run and not a.output:
         ap.error('-o/--output is required')
     if a.output and os.path.abspath(a.output) == os.path.abspath(a.input):

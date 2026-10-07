@@ -4,11 +4,13 @@ Frames are matched by (IDR period, POC): dropping pictures never touches POC
 and never drops an IDR, so each output picture has exactly one original.
 The work is split into groups of IDR periods decoded in parallel.
 """
+import hashlib
 import multiprocessing as mp
 
 import numpy as np
 
 from .decode import frame_size, iter_frames
+from .system import VERIFY_PEAK, peak_rss, pool_size, worker_init
 
 
 def mb_maxdiff(a, b, W, H):
@@ -24,39 +26,52 @@ def mb_maxdiff(a, b, W, H):
 
 
 def _job(args):
+    """Compare one group of IDR periods. Only one ffmpeg decoder runs at a
+    time: the original is decoded and hashed, then the output is decoded and
+    compared by hash; frames that differ are decoded from the original again
+    (kept only for those POCs) to measure per-macroblock differences."""
     orig_es, out_es, orange, nrange, okeys, nkeys, W, H, fs, disp_of = args
     nset = set(nkeys)
-    res = {'compared': 0, 'exact': 0, 'differing': [], 'missing': 0, 'errors': []}
+    res = {'compared': 0, 'exact': 0, 'differing': [], 'errors': []}
     try:
-        it_o = iter_frames(orig_es, [orange], fs)
-        it_n = iter_frames(out_es, [nrange], fs)
-        nk = iter(nkeys)
-        for key in okeys:
-            fo = next(it_o)
-            if key not in nset:
-                continue
-            kn = next(nk)
-            fn = next(it_n)
-            assert kn == key, (kn, key)
+        ohash = {}
+        n = 0
+        for n, fo in enumerate(iter_frames(orig_es, [orange], fs), 1):
+            if n > len(okeys):
+                raise RuntimeError('original group decoded too many frames')
+            if okeys[n - 1] in nset:
+                ohash[okeys[n - 1]] = hashlib.blake2b(fo, digest_size=16).digest()
+        if n != len(okeys):
+            raise RuntimeError(f'original group decoded {n} frames, expected {len(okeys)}')
+        bad = {}
+        n = 0
+        for n, fn in enumerate(iter_frames(out_es, [nrange], fs), 1):
+            if n > len(nkeys):
+                raise RuntimeError('output group decoded too many frames')
+            key = nkeys[n - 1]
             res['compared'] += 1
-            if fo == fn:
+            if hashlib.blake2b(fn, digest_size=16).digest() == ohash[key]:
                 res['exact'] += 1
-                continue
-            m = mb_maxdiff(fo, fn, W, H)
-            res['differing'].append({'display': disp_of[key], 'period': key[0], 'poc': key[1],
-                                     'worst': int(m.max()), 'mbs_ge3': int((m >= 3).sum()),
-                                     'mbs_diff': int((m > 0).sum())})
-        for _ in it_n:
-            res['errors'].append('output has extra frames')
-            break
-        for _ in it_o:
-            pass
-    except (RuntimeError, StopIteration, AssertionError) as e:
+            else:
+                bad[key] = fn
+        if n != len(nkeys):
+            raise RuntimeError(f'output group decoded {n} frames, expected {len(nkeys)}')
+        if bad:
+            for key, fo in zip(okeys, iter_frames(orig_es, [orange], fs)):
+                if not bad:
+                    break
+                if key in bad:
+                    m = mb_maxdiff(fo, bad.pop(key), W, H)
+                    res['differing'].append({'display': disp_of[key], 'period': key[0], 'poc': key[1],
+                                             'worst': int(m.max()), 'mbs_ge3': int((m >= 3).sum()),
+                                             'mbs_diff': int((m > 0).sum())})
+    except (RuntimeError, KeyError) as e:
         res['errors'].append(f'{type(e).__name__}: {e}')
+    res['peak_rss'] = peak_rss()
     return res
 
 
-def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group=600):
+def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group=300):
     sps = spss[0]
     W, H = sps['mb_w'], sps['mb_h']
     fs = frame_size(sps)
@@ -90,12 +105,16 @@ def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group
             n = 0
     flush()
     tot = {'compared': 0, 'exact': 0, 'differing': [], 'errors': []}
-    with mp.get_context('spawn').Pool(workers) as pool:
+    nproc = pool_size(workers, VERIFY_PEAK, len(jobs))
+    log(f'  verify: {len(jobs)} groups on {nproc} workers (one decoder each)')
+    peak = 0
+    with mp.get_context('spawn').Pool(nproc, initializer=worker_init) as pool:
         for i, r in enumerate(pool.imap_unordered(_job, jobs)):
             for k in ('compared', 'exact'):
                 tot[k] += r[k]
             tot['differing'] += r['differing']
             tot['errors'] += r['errors']
+            peak = max(peak, r['peak_rss'])
             if (i + 1) % 10 == 0 or i + 1 == len(jobs):
                 log(f'  verify: {i + 1}/{len(jobs)} groups, {tot["compared"]} frames compared, '
                     f'{len(tot["differing"])} differ')
@@ -105,5 +124,6 @@ def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group
         'frames_output': len(out_pics), 'frames_compared': tot['compared'], 'bit_exact': tot['exact'],
         'differing': len(diff), 'worst_difference': max((d['worst'] for d in diff), default=0),
         'mbs_ge3': sum(d['mbs_ge3'] for d in diff), 'mbs_differing': sum(d['mbs_diff'] for d in diff),
-        'errors': tot['errors'], 'differing_frames': diff,
+        'errors': tot['errors'], 'workers': nproc, 'worker_peak_rss_mb': round(peak / 2**20),
+        'differing_frames': diff,
     }

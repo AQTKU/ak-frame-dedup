@@ -24,6 +24,7 @@ from .h264mv import derive_motion
 from .patch import patch_pictures
 from .roundtrip_test import decode_picture
 from .stream import new_lists
+from .system import REPAIR_PEAK, lower_priority, peak_rss, pool_size
 
 
 def find_candidates(spss, pics, drop):
@@ -69,6 +70,7 @@ _G = {}
 
 
 def _init(orig_es, new_es, spss, ppss):
+    lower_priority()
     _G.update(orig_es=orig_es, new_es=new_es, spss=spss, ppss=ppss)
 
 
@@ -136,7 +138,7 @@ def run_task(task):
     f.close()
     return {'period': task['period'], 'repl': repl, 'stats': stats, 'sniff': sniff,
             'patches': {nd: len(v) for nd, v in patches.items()}, 'log': log_lines,
-            'seconds': round(time.time() - t0, 1)}
+            'seconds': round(time.time() - t0, 1), 'peak_rss': peak_rss()}
 
 
 def repair(orig_es, new_es, spss, ppss, pics, new_pics, drop, workers, log=print):
@@ -146,8 +148,11 @@ def repair(orig_es, new_es, spss, ppss, pics, new_pics, drop, workers, log=print
     tasks = build_tasks(pics, new_pics, new_of, cands)
     log(f'repair: {len(cands)} pictures with a changed reference context in {len(tasks)} IDR periods')
     results = []
+    nproc = pool_size(workers, REPAIR_PEAK, len(tasks)) if tasks else 0
     if tasks:
-        with mp.get_context('spawn').Pool(min(workers, len(tasks)), initializer=_init,
+        log(f'repair: {nproc} workers')
+        # workers are recycled every 2 tasks so their memory peak does not creep
+        with mp.get_context('spawn').Pool(nproc, initializer=_init, maxtasksperchild=2,
                                           initargs=(orig_es, new_es, spss, ppss)) as pool:
             for i, r in enumerate(pool.imap_unordered(run_task, tasks)):
                 results.append(r)
@@ -157,9 +162,12 @@ def repair(orig_es, new_es, spss, ppss, pics, new_pics, drop, workers, log=print
     repl = {}
     summary = {'candidate_pictures': len(cands), 'periods': len(tasks), 'pictures_rewritten': 0,
                'pcm_mbs': 0, 'bytes_added': 0, 'skip_to_explicit': 0, 'direct_to_explicit': 0,
-               'qp_carriers': 0, 'pictures': []}
+               'qp_carriers': 0, 'workers': nproc,
+               'worker_peak_rss_mb': round(max((r['peak_rss'] for r in results), default=0) / 2**20),
+               'sniff': [], 'pictures': []}
     for r in sorted(results, key=lambda r: r['period']):
         repl.update(r['repl'])
+        summary['sniff'] += r['sniff']
         for nd, s in sorted(r['stats'].items()):
             summary['pictures_rewritten'] += 1
             summary['pcm_mbs'] += s['pcm']

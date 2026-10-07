@@ -2,9 +2,11 @@
 import json
 import subprocess
 
+from .system import popen_kwargs
+
 
 def identify(mkv):
-    r = subprocess.run(['mkvmerge', '-J', mkv], capture_output=True, text=True, encoding='utf-8')
+    r = subprocess.run(['mkvmerge', '-J', mkv], capture_output=True, text=True, encoding='utf-8', **popen_kwargs())
     if r.returncode not in (0, 1):
         raise RuntimeError(f'mkvmerge -J failed: {r.stdout[:300]} {r.stderr[:300]}')
     return json.loads(r.stdout)
@@ -34,7 +36,7 @@ def mux(in_mkv, es, out_mkv, fps_out, log=print):
         cmd += ['--display-dimensions', f"0:{vp['display_dimensions']}"]
     cmd += ['--default-duration', f'0:{rate}', es, '--no-video', in_mkv]
     log('  ' + ' '.join(f'"{c}"' if ' ' in c else c for c in cmd))
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', **popen_kwargs())
     if r.returncode >= 2:
         raise RuntimeError(f'mkvmerge failed: {r.stdout[-500:]} {r.stderr[-500:]}')
     return [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
@@ -43,7 +45,7 @@ def mux(in_mkv, es, out_mkv, fps_out, log=print):
 def track_durations(mkv):
     """{(type, index): seconds} from the per-track statistics tags."""
     r = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=index,codec_type:stream_tags=DURATION',
-                        '-of', 'json', mkv], capture_output=True, text=True, encoding='utf-8')
+                        '-of', 'json', mkv], capture_output=True, text=True, encoding='utf-8', **popen_kwargs())
     out = {}
     for s in json.loads(r.stdout or '{}').get('streams', []):
         d = (s.get('tags') or {}).get('DURATION')

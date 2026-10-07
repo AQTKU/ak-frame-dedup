@@ -14,6 +14,7 @@ from .mux import duration_check, mux
 from .plan import choose_drops, offsets, sync_correct, sync_stats
 from .repair import repair
 from .stream import Unsupported, extract_annexb, input_rate, load, write_stream
+from .system import Logger, peak_rss, physical_ram
 from .verify import verify
 
 
@@ -26,16 +27,17 @@ def _fps_str(fr):
 
 
 class Run:
-    def __init__(self, args, log=print):
+    def __init__(self, args, log=None):
         self.a = args
-        self.log0 = log
+        os.makedirs(args.work, exist_ok=True)
+        self.log0 = log or Logger(os.path.join(args.work, 'run.log'))
         self.t0 = time.time()
         self.times = {}
         self.report = {'tool': 'frame_dedup', 'version': __version__, 'input': os.path.abspath(args.input),
                        'output': os.path.abspath(args.output) if args.output else None}
 
     def log(self, msg):
-        self.log0(f'[{time.time() - self.t0:7.1f}s] {msg}')
+        self.log0(msg)
 
     def stage(self, name, t):
         self.times[name] = round(time.time() - t, 1)
@@ -74,7 +76,7 @@ class Run:
                 feat = None
         if feat is None:
             self.log('decoding the low-res luma proxy')
-            feat = proxy_features(es)
+            feat = proxy_features(es, threads=min(8, a.workers))
             if len(feat['mad']) != N:
                 raise RuntimeError(f'proxy decode produced {len(feat["mad"])} frames for {N} pictures')
             np.savez(feat_path, es_size=os.path.getsize(es), **feat)
@@ -256,10 +258,15 @@ class Run:
         self.stage('verify', t)
 
 
-def run(args, log=print):
+def run(args, log=None):
     """Returns the process exit code."""
     R = Run(args, log)
     code = 0
+    total, _ = physical_ram()
+    R.report['resources'] = {'workers': args.workers, 'cpu_count': os.cpu_count(),
+                             'physical_ram_gb': round(total / 2**30, 1)}
+    R.log(f'frame_dedup {__version__}: {args.workers} workers, {os.cpu_count()} logical CPUs, '
+          f'{total / 2**30:.1f} GB RAM, below-normal priority')
     try:
         R.analyse()
         R.plan()
@@ -284,6 +291,9 @@ def run(args, log=print):
         code = 3
     finally:
         R.report['runtime_s'] = {**R.times, 'total': round(time.time() - R.t0, 1)}
+        R.report['resources']['main_peak_rss_mb'] = round(peak_rss() / 2**20)
+        R.log(f"done: status {R.report.get('status')}, main process peak RSS "
+              f"{R.report['resources']['main_peak_rss_mb']} MB, total {R.report['runtime_s']['total']} s")
         if args.report:
             with open(args.report, 'w') as f:
                 json.dump(R.report, f, indent=1, default=str)
@@ -292,7 +302,7 @@ def run(args, log=print):
     return code
 
 
-WORK_FILES = ('in.h264', 'dedup.h264', 'out.h264', 'features.npz')
+WORK_FILES = ('in.h264', 'dedup.h264', 'out.h264', 'features.npz')  # run.log is kept
 
 
 def cleanup(work):

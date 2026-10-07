@@ -5,6 +5,7 @@ import subprocess
 
 from .h264hdr import escape, parse_stream, patch_sps_timing, set_bits, sps_frame_rate, unescape
 from .h264mv import dpb_walk
+from .system import popen_kwargs
 
 
 class Unsupported(Exception):
@@ -13,7 +14,8 @@ class Unsupported(Exception):
 
 def extract_annexb(mkv, out_path):
     r = subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', mkv, '-map', '0:v:0', '-c', 'copy',
-                        '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', out_path], capture_output=True, text=True)
+                        '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', out_path], capture_output=True, text=True,
+                       **popen_kwargs())
     if r.returncode:
         raise Unsupported(f'could not extract an H.264 video stream: {r.stderr.strip()[:400]}')
 

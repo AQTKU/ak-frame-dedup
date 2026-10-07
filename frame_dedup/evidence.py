@@ -15,18 +15,21 @@ import subprocess
 
 import numpy as np
 
+from .system import popen_kwargs
+
 PW, PH = 480, 270
 BW, BH = 16, 15  # proxy block size (30 x 18 blocks)
 
 _MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cadence_model.json')
 
 
-def proxy_features(es_path, threads=0, log=print, batch=256):
+def proxy_features(es_path, threads=8, log=print, batch=256):
     """Decode the Annex-B stream to the gray proxy and return a dict of arrays."""
     cmd = ['ffmpeg', '-v', 'error', '-threads', str(threads), '-f', 'h264', '-i', es_path,
            '-fps_mode', 'passthrough', '-vf', f'scale={PW}:{PH}:flags=area,format=gray',
            '-f', 'rawvideo', '-']
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=PW * PH * 32)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=PW * PH * 32,
+                         **popen_kwargs())
     fs = PW * PH
     mad, bmax, mean, mx = [], [], [], []
     prev = None
