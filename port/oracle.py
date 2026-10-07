@@ -1400,5 +1400,109 @@ def patch_synth(pkl, out, seed, rounds, density, *periods):
         f.write(text(result))
 
 
+# ---------------------------------------------------------------------------
+# repair and anchor-rebuild drivers (Rust: repair.rs, rebuild.rs)
+# ---------------------------------------------------------------------------
+
+@command
+def repair_scenario(work, mkv, out):
+    """repair-scenario <work dir> <input.mkv> <out.json>: run the pipeline's analyse / plan / write in-process on
+    the work dir of a finished `--keep-work` run (its in.h264 and features.npz are reused, nothing is decoded or
+    written; dedup.h264 / out.h264 are only read) and write the arguments it passes to `repair` and to `rebuild`
+    as JSON: orig_es, new_es (dedup.h264), work, drop (original decode indices), sigma and orig_of_out (explicit
+    mode), and `rebuild` {src_es, src_orig, rbs} for the anchor rebuild that follows. `dev repair` and
+    `dev rebuild` take this file."""
+    import types
+    from frame_dedup import pipeline as P
+
+    class Done(Exception):
+        pass
+
+    work = os.path.abspath(work)
+    args = types.SimpleNamespace(input=mkv, output=None, work=work, workers=4, report=None, verify=False,
+                                 keep_work=True, dry_run=False, no_rebuild=False, keep_idr_pairs=False)
+    cap = {}
+    has_out = os.path.exists(os.path.join(work, 'out.h264'))
+
+    def fake_repair(*a, **k):
+        cap['repair'] = (a, dict(k))
+        # the real run's out.h264 exists when the repair rewrote anything
+        return ({0: b''} if has_out else {}), {'pictures_rewritten': 0, 'pcm_mbs': 0, 'bytes_added': 0}
+
+    def fake_rebuild(*a, **k):
+        cap['rebuild'] = (a, dict(k))
+        raise Done()
+    P.extract_annexb = lambda *a, **k: None
+    P.write_stream = lambda *a, **k: (0, 0)
+    P.write_explicit = lambda *a, **k: (0, 0)
+    P.repair = fake_repair
+    P.rebuild = fake_rebuild
+    run = P.Run(args, log=lambda s: print(s, file=sys.stderr, flush=True))
+    run.analyse()
+    run.plan()
+    try:
+        run.write()
+    except Done:
+        pass
+    scn = {'explicit': bool(run.explicit), 'work': work}
+    if 'repair' in cap:
+        a, k = cap['repair']
+        scn.update(orig_es=os.path.abspath(a[0]), new_es=os.path.abspath(a[1]), drop=sorted(a[6]),
+                   sigma=None if k.get('sigma') is None else {str(d): v for d, v in sorted(k['sigma'].items())},
+                   orig_of_out=k.get('orig_of_out'))
+    if 'rebuild' in cap:
+        a, _ = cap['rebuild']
+        scn['orig_es'] = os.path.abspath(a[0])
+        scn['rebuild'] = {'src_es': os.path.abspath(a[1]), 'src_orig': a[7],
+                          'rbs': [{'K': r['K'], 'D': r['D'], 'B': r['B']} for r in a[8]]}
+    with open(out, 'w') as f:
+        json.dump(scn, f)
+    print(f'explicit {scn["explicit"]}, drop {len(scn.get("drop", []))}, repair {"repair" in cap}, '
+          f'rebuild {len(scn["rebuild"]["rbs"]) if "rebuild" in scn else None} pairs', file=sys.stderr)
+
+
+@command
+def compare_report(a_json, b_json, *sections):
+    """compare-report <python report.json> <rust report.json> <section>...: compare the named sections
+    (`repair`, `anchor_rebuilds`) ignoring wall-clock and per-worker fields (seconds, workers,
+    worker_peak_rss_mb, wall_seconds); the Rust file is a `dev repair` / `dev rebuild` report. Prints the
+    first differences and exits 1 if there are any."""
+    ignore = {'seconds', 'workers', 'worker_peak_rss_mb', 'wall_seconds'}
+
+    def strip(v):
+        if isinstance(v, dict):
+            return {k: strip(x) for k, x in v.items() if k not in ignore}
+        if isinstance(v, list):
+            return [strip(x) for x in v]
+        return v
+    ra, rb = json.load(open(a_json)), json.load(open(b_json))
+    bad = 0
+
+    def diff(x, y, path):
+        nonlocal bad
+        if bad > 12:
+            return
+        if isinstance(x, dict) and isinstance(y, dict):
+            for k in sorted(set(x) | set(y)):
+                if k not in x or k not in y:
+                    print(f'{path}/{k}: only in {"python" if k in x else "rust"}')
+                    bad += 1
+                else:
+                    diff(x[k], y[k], f'{path}/{k}')
+        elif isinstance(x, list) and isinstance(y, list):
+            if len(x) != len(y):
+                print(f'{path}: {len(x)} entries in python, {len(y)} in rust')
+                bad += 1
+            for i, (p, q) in enumerate(zip(x, y)):
+                diff(p, q, f'{path}[{i}]')
+        elif x != y or type(x) is not type(y) and not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
+            print(f'{path}: python {x!r}, rust {y!r}')
+            bad += 1
+    for s in sections:
+        diff(strip(ra[s]), strip(rb.get(s)), s)
+    print('identical' if not bad else f'{bad}+ differences')
+    sys.exit(1 if bad else 0)
+
+
 if __name__ == '__main__':
     main(sys.argv[1:])
