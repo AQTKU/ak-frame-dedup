@@ -52,3 +52,11 @@ pub struct Args {
     #[arg(long)]
     pub dry_run: bool,
 }
+
+/// Run the whole pipeline; returns the process exit code.
+/// STUB: the real pipeline is not ported yet (see port/PORTING.md).
+pub fn run(args: Args) -> i32 {
+    let _ = args;
+    eprintln!("error: the pipeline is not ported yet");
+    1
+}
