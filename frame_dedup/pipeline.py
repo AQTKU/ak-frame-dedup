@@ -12,6 +12,7 @@ from .cadence import (FAIL_SCORE, INPUT_RATES, MIN_EVIDENCE_DUPS, SOURCE_RATES, 
 from .evidence import black_runs, evidence, load_model, proxy_features, static_mask
 from .mux import duration_check, mux
 from .plan import choose_drops, offsets, sync_correct, sync_stats
+from .rebuild import candidate, rebuild
 from .repair import repair
 from .stream import Unsupported, extract_annexb, free_drop_checker, input_rate, load, write_stream
 from .system import Logger, peak_rss, physical_ram
@@ -153,21 +154,33 @@ class Run:
         for p in pics:
             disp[p['disp']] = p
         self.disp = disp
-        drop, hard, unsupported, freed, subs = choose_drops(disp, self.dup, free_drop_checker(self.spss, pics),
-                                                            self.feat['mad'], self.feat['bmax'],
-                                                            visible_subs=not getattr(self.a, 'keep_idr_pairs', False))
+        rebuildable = None
+        if not getattr(self.a, 'no_rebuild', False):
+            periods = {}
+            for p in pics:
+                periods.setdefault(p['period'], []).append(p)
+            rebuildable = lambda K, D: candidate(self.spss, pics, periods, K, D)
+        drop, hard, unsupported, freed, subs, rebuilds = choose_drops(
+            disp, self.dup, free_drop_checker(self.spss, pics), self.feat['mad'], self.feat['bmax'],
+            visible_subs=not getattr(self.a, 'keep_idr_pairs', False), rebuildable=rebuildable)
+        fallbacks = [r for r in rebuilds if 'fallback' in r]
+        rebuilds = [r for r in rebuilds if 'fallback' not in r]
         n_planned = len(drop)
-        n_nonref = len(drop) - len(hard) - len(freed) - len(subs)
+        n_nonref = len(drop) - len(hard) - len(freed) - len(subs) - len(rebuilds)
         events = [c['display'] for c in self.report['cadence']['phase_changes'] if c['at'] == 'cut']
         events += [u['display'] for u in unsupported]
         drop, corrections = sync_correct(disp, drop, self.best['r'], self.black, events)
         hard = [h for h in hard if h['dropped_display'] in drop]
+        rebuilds = [r for r in rebuilds if r['dropped_display'] in drop and r['kept_display'] not in drop]
+        for f in fallbacks:
+            self.log(f"  anchor rebuild not possible at display {f['pair']} ({f['types']}): {f['fallback']}")
         for u in unsupported:
             self.log(f"  unsupported pair at display {u['display']} ({u['types']}): {u['reason']}; both kept")
         for c in corrections:
             self.log(f"  sync correction in black run {c['black_run']}: {c['action']}")
         self.drop = drop
         self.hard = hard
+        self.rebuilds = rebuilds
         st = sync_stats(N, drop, self.best['r'], float(self.fps_out))
         off = offsets(N, drop, self.best['r'])
         chunk_off = []
@@ -181,13 +194,16 @@ class Run:
                                 'non_reference': n_nonref, 'unreferenced_reference': len(freed),
                                 'substitute_invisible': sum(1 for x in subs if not x['visible']),
                                 'substitute_visible': sum(1 for x in subs if x['visible']),
-                                'hard': len(hard), 'sync_net_change': len(drop) - n_planned}
+                                'hard': len(hard), 'anchor_rebuild': len(rebuilds),
+                                'anchor_rebuild_fallbacks': len(fallbacks), 'sync_net_change': len(drop) - n_planned}
         self.report['unreferenced_reference_drops'] = freed
         self.report['substitute_drops'] = subs
         self.report['hard_pairs'] = hard
+        self.report['anchor_rebuild_fallbacks'] = fallbacks
         self.report['unsupported_pairs'] = unsupported
         self.report['sync'] = {'corrections': corrections, **st}
         self.log(f'dropping {len(drop)} pictures ({len(freed)} unreferenced reference twins, '
+                 f'{len(rebuilds)} anchor rebuilds ({len(fallbacks)} fell back), '
                  f'{len(subs)} substitutes ({sum(1 for x in subs if x["visible"])} visible), {len(hard)} hard pairs, '
                  f'{len(unsupported)} unsupported pairs, '
                  f'{len(corrections)} sync corrections); output {N - len(drop)} frames, '
@@ -201,8 +217,9 @@ class Run:
         timing = (fo.denominator, 2 * fo.numerator)
         t = time.time()
         stage1 = os.path.join(a.work, 'dedup.h264')
-        drop_dec = {self.disp[i]['dec'] for i in self.drop}
-        self.drop_dec = drop_dec
+        # rebuilt pairs drop K in a third stage, after the hard-drop repair
+        rb_K = {r['K_dec'] for r in self.rebuilds}
+        drop_dec = {self.disp[i]['dec'] for i in self.drop} - rb_K
         n_renum, n_sps = write_stream(self.es, self.pics, self.spss, stage1, drop=drop_dec, timing=timing)
         self.report['sps_timing'] = {'num_units_in_tick': timing[0], 'time_scale': timing[1], 'sps_patched': n_sps}
         self.log(f'wrote {stage1}: {n_renum} slices renumbered, {n_sps} SPS timing patched to {timing[0]}/{timing[1]}')
@@ -221,6 +238,24 @@ class Run:
                      f"{rep['bytes_added']:+d} bytes")
             self.stage('repair', t)
         self.report['repair'] = rep
+        src_orig = [p['dec'] for p in self.pics if p['dec'] not in drop_dec]  # stage-1/2 decode order
+        self.orig_of_out = src_orig
+        if self.rebuilds:
+            t = time.time()
+            nspss, nppss, src_pics = load(out_es)
+            src_of = {d: i for i, d in enumerate(src_orig)}
+            rbs = [{'K': src_of[r['K_dec']], 'D': src_of[r['D_dec']],
+                    'B': [src_of[b] for b in r['B_dec'] if b in src_of]} for r in self.rebuilds]
+            rb_es = os.path.join(a.work, 'rebuilt.h264')
+            self.orig_of_out, rb = rebuild(self.es, out_es, rb_es, nspss, nppss, self.pics, src_pics, src_orig, rbs,
+                                           a.workers, a.work, log=self.log)
+            self.report['anchor_rebuilds'] = rb
+            self.log(f"anchor rebuild: {rb['pairs']} pairs, {rb['leading_b_pictures']} leading B pictures, "
+                     f"{rb['pcm_mbs']} PCM MBs, {rb['direct_explicit']} direct MBs made explicit, "
+                     f"{rb['bytes_added']:+d} bytes, worst difference in the leading B pictures "
+                     f"{rb['worst_in_leading_b']}")
+            out_es = rb_es
+            self.stage('rebuild', t)
         self.out_es = out_es
 
     # ------------------------------------------------------------------
@@ -248,7 +283,8 @@ class Run:
         t = time.time()
         self.log('verifying: decoding output and original')
         ospss, _, opics = load(self.out_es)
-        res = verify(self.es, self.out_es, self.spss, self.pics, opics, self.a.workers, log=self.log)
+        res = verify(self.es, self.out_es, self.spss, self.pics, opics, self.a.workers, log=self.log,
+                     orig_of_out=self.orig_of_out)
         # hard-drop neighbourhoods: frames after a dropped reference twin, up
         # to the end of its IDR period
         hood = set()
@@ -258,7 +294,15 @@ class Run:
         for h in self.hard:
             D = self.pics[h['dropped_dec']]
             hood.update(range(D['disp'] + 1, period_end[D['period']] + 1))
-        outside = [d for d in res['differing_frames'] if d['display'] not in hood]
+        # leading B pictures of rebuilt pairs (they read I2 where they read K)
+        lead = {self.pics[b]['disp'] for r in self.rebuilds for b in r['B_dec']} - set(self.drop)
+        in_lead = [d for d in res['differing_frames'] if d['display'] in lead]
+        res['rebuild_leading_b'] = {'pictures': len(lead), 'differing': len(in_lead),
+                                    'worst': max((d['worst'] for d in in_lead), default=0),
+                                    'mbs_ge3': sum(d['mbs_ge3'] for d in in_lead),
+                                    'worst_luma': max((d['worst_luma'] for d in in_lead), default=0),
+                                    'mbs_ge3_luma': sum(d['mbs_ge3_luma'] for d in in_lead)}
+        outside = [d for d in res['differing_frames'] if d['display'] not in hood and d['display'] not in lead]
         res['differing_outside_hard_neighbourhoods'] = len(outside)
         res['worst_outside'] = max((d['worst'] for d in outside), default=0)
         res['ok'] = not outside and not res['errors'] and res['frames_compared'] == res['frames_output']
@@ -266,7 +310,10 @@ class Run:
         self.log(f"verify: {res['frames_compared']} frames compared, {res['bit_exact']} bit-exact, "
                  f"{res['differing']} differ (worst {res['worst_difference']}, {res['mbs_ge3']} MBs >= 3; "
                  f"luma worst {res['worst_luma']}, {res['mbs_ge3_luma']} MBs >= 3), "
-                 f"{len(outside)} differing outside hard-drop neighbourhoods; errors {len(res['errors'])}")
+                 f"{len(outside)} differing outside hard-drop neighbourhoods and rebuilt leading B pictures "
+                 f"(leading B: {res['rebuild_leading_b']['differing']} differ, worst "
+                 f"{res['rebuild_leading_b']['worst']}, {res['rebuild_leading_b']['mbs_ge3']} MBs >= 3); "
+                 f"errors {len(res['errors'])}")
         self.stage('verify', t)
 
 
@@ -314,7 +361,7 @@ def run(args, log=None):
     return code
 
 
-WORK_FILES = ('in.h264', 'dedup.h264', 'out.h264', 'features.npz')  # run.log is kept
+WORK_FILES = ('in.h264', 'dedup.h264', 'out.h264', 'rebuilt.h264', 'features.npz')  # run.log is kept
 
 
 def cleanup(work):

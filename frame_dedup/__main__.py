@@ -22,10 +22,12 @@ def main(argv=None):
     ap.add_argument('--workers', type=int, default=default_workers(),
                     help='parallel worker processes (default: half the logical CPUs); memory-heavy '
                          'stages use fewer if RAM is short')
+    ap.add_argument('--no-rebuild', action='store_true',
+                    help='never demote an IDR to drop the earlier twin of a pair whose later twin is an IDR '
+                         '(anchor rebuild); use the fallbacks below instead')
     ap.add_argument('--keep-idr-pairs', action='store_true',
-                    help='when the later twin of a duplicate pair is an IDR and its earlier twin is still referenced, '
-                         'keep both (A/V corrected only at black runs) instead of dropping the nearest '
-                         'low-motion non-reference frame')
+                    help='when an IDR-later pair cannot be rebuilt, keep both twins (A/V corrected only at black '
+                         'runs) instead of dropping the nearest low-motion non-reference frame')
     ap.add_argument('--dry-run', action='store_true', help='detect and plan only; write no video')
     a = ap.parse_args(argv)
     lower_priority()

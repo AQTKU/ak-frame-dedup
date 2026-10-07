@@ -10,10 +10,12 @@ Drop rules for a duplicate pair (n-1, n) in display order:
     frames that is a visually lossless repeat of its predecessor (black or
     static), keeping the frame count without any repair,
   * else the later twin -- a "hard" drop that is repaired afterwards --
-    unless it is an IDR: then the cheap picture within 3 frames with the
-    least motion is dropped instead (a visible substitute: one real frame is
-    lost, but A/V sync holds); only if there is none is the pair kept
-    ("unsupported") and the count corrected in the next black run.
+    unless it is an IDR: then the earlier twin K is dropped by an "anchor
+    rebuild" (the IDR is demoted and takes K's place, see rebuild.py) when
+    `rebuildable` allows it; otherwise the cheap picture within 3 frames
+    with the least motion is dropped instead (a visible substitute: one real
+    frame is lost, but A/V sync holds); only if there is none is the pair
+    kept ("unsupported") and the count corrected in the next black run.
 
 A/V sync: kept frame n becomes output frame k, shown at k / fps_out where it
 was shown at n / fps_in. Its offset in output frames is k - n * r. Inside a
@@ -30,15 +32,18 @@ INVISIBLE_MAD = 0.25      # proxy mean / block-max difference below which a fram
 INVISIBLE_BMAX = 1.0      # a visually lossless repeat of its predecessor
 
 
-def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True):
+def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True, rebuildable=None):
     """disp: pictures in display order; dup: bool per display index;
     free(dec) -> bool tells whether dropping a reference picture leaves all
     other reference lists unchanged; mad / bmax: proxy differences of each
-    frame to its predecessor (for substitute drops).
+    frame to its predecessor (for substitute drops); rebuildable(K dec,
+    D dec) -> (rebuild dict or None, reason) for pairs whose later twin is an
+    IDR.
     Returns (drop set of display indices, hard list, unsupported list,
-    free-reference drops list, substitutes list)."""
+    free-reference drops list, substitutes list, rebuilds list). A rebuild
+    entry records the pair and why it fell back if it did ('fallback')."""
     N = len(disp)
-    drop, hard, unsupported, freed, subs = set(), [], [], [], []
+    drop, hard, unsupported, freed, subs, rebuilds = set(), [], [], [], [], []
     twins = set()
     for n in np.nonzero(dup)[0]:
         twins.update((int(n) - 1, int(n)))
@@ -88,6 +93,14 @@ def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True):
                 hard.append({'kept_display': n - 1, 'dropped_display': n, 'kept_dec': a['dec'],
                              'dropped_dec': b['dec'], 'types': types})
             else:
+                rb, why = rebuildable(a['dec'], b['dec']) if rebuildable else (None, None)
+                if rb is not None:
+                    drop.add(n - 1)
+                    rebuilds.append({'pair': n, 'dropped_display': n - 1, 'kept_display': n, 'types': types,
+                                     'K_dec': a['dec'], 'D_dec': b['dec'], 'B_dec': rb['B']})
+                    continue
+                if rebuildable:
+                    rebuilds.append({'pair': n, 'types': types, 'fallback': why})
                 s = substitute(n, invisible=False) if visible_subs else None
                 if s is not None:
                     drop.add(s)
@@ -96,7 +109,7 @@ def choose_drops(disp, dup, free=None, mad=None, bmax=None, visible_subs=True):
                 else:
                     unsupported.append({'display': n, 'reason': 'later twin is an IDR and no substitute',
                                         'types': types})
-    return drop, hard, unsupported, freed, subs
+    return drop, hard, unsupported, freed, subs, rebuilds
 
 
 def offsets(N, drop, r):

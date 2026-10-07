@@ -1,8 +1,11 @@
 """Decode the output and the original and compare every kept frame.
 
-Frames are matched by (IDR period, POC): dropping pictures never touches POC
-and never drops an IDR, so each output picture has exactly one original.
-The work is split into groups of IDR periods decoded in parallel.
+Frames are matched by (IDR period, POC) of the original: dropping pictures
+never touches POC and never drops an IDR, so each output picture has exactly
+one original. Anchor rebuilds merge IDR periods and shift POCs; for them the
+caller passes the original of every output picture. The work is split into
+groups of output IDR periods (each covering whole original periods) decoded
+in parallel.
 """
 import hashlib
 import multiprocessing as mp
@@ -72,7 +75,11 @@ def _job(args):
     return res
 
 
-def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group=300):
+def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group=300, orig_of_out=None):
+    """orig_of_out: original decode index of every output picture (output
+    decode order). Without it, output pictures are matched to originals by
+    (IDR period, POC), which holds when pictures were only dropped. Anchor
+    rebuilds merge IDR periods and shift POCs, so the pipeline passes it."""
     sps = spss[0]
     W, H = sps['mb_w'], sps['mb_h']
     fs = frame_size(sps)
@@ -83,24 +90,33 @@ def verify(orig_es, out_es, spss, orig_pics, out_pics, workers, log=print, group
             out.setdefault(p['period'], []).append(p)
         return out
     po, pn = periods(orig_pics), periods(out_pics)
-    if sorted(po) != sorted(pn):
-        raise RuntimeError('IDR periods differ between original and output')
+    if orig_of_out is None:
+        key_of = {q['dec']: (q['period'], q['poc']) for q in out_pics}
+    else:
+        assert len(orig_of_out) == len(out_pics)
+        key_of = {q['dec']: (orig_pics[o]['period'], orig_pics[o]['poc']) for q, o in zip(out_pics, orig_of_out)}
+    # each output IDR period covers whole original IDR periods
+    cover = {g: sorted({key_of[q['dec']][0] for q in pn[g]}) for g in pn}
+    flat = [x for g in sorted(pn) for x in cover[g]]
+    if flat != sorted(po) or any(c != list(range(c[0], c[-1] + 1)) for c in cover.values()):
+        raise RuntimeError('output IDR periods do not map onto whole original IDR periods')
     jobs, cur = [], []
 
     def flush():
         if not cur:
             return
-        a, b = cur[0], cur[-1]
-        okeys = sorted((p['period'], p['poc']) for g in cur for p in po[g])
-        nkeys = sorted((p['period'], p['poc']) for g in cur for p in pn[g])
-        disp_of = {(p['period'], p['poc']): p['disp'] for g in cur for p in po[g]}
+        og = [x for g in cur for x in cover[g]]
+        a, b = og[0], og[-1]
+        okeys = sorted((p['period'], p['poc']) for g in og for p in po[g])
+        nkeys = [key_of[q['dec']] for g in cur for q in sorted(pn[g], key=lambda q: q['poc'])]
+        disp_of = {(p['period'], p['poc']): p['disp'] for g in og for p in po[g]}
         jobs.append((orig_es, out_es, (po[a][0]['au_start'], po[b][-1]['au_end']),
-                     (pn[a][0]['au_start'], pn[b][-1]['au_end']), okeys, nkeys, W, H, fs, disp_of))
+                     (pn[cur[0]][0]['au_start'], pn[cur[-1]][-1]['au_end']), okeys, nkeys, W, H, fs, disp_of))
         cur.clear()
     n = 0
-    for g in sorted(po):
+    for g in sorted(pn):
         cur.append(g)
-        n += len(po[g])
+        n += len(pn[g])
         if n >= group:
             flush()
             n = 0
