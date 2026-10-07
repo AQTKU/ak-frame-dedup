@@ -13,6 +13,7 @@ pub fn main(args: &[String]) -> Result<()> {
         "framemd5" => crate::decode::dev_framemd5(rest),
         "mux-cmd" | "mux" | "duration-check" => crate::mux::dev_main(cmd, rest),
         "maxdiff" => crate::verify::dev_maxdiff(rest),
+        "verify" => crate::verify::dev_verify(rest),
         "sysinfo" => crate::system::dev_sysinfo(),
         "headers" => crate::stream::dev_headers(rest),
         "escape" => crate::stream::dev_escape(rest),

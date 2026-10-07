@@ -30,11 +30,14 @@ fn main() {
     if !args.input.exists() {
         fail(format!("{} does not exist", args.input.display()));
     }
+    if args.mb_report.is_some() && !args.verify {
+        fail("--mb-report needs --verify".into());
+    }
     if args.work.is_none() {
         let stem = args.input.file_stem().map(PathBuf::from).unwrap_or_default();
         args.work = Some(Path::new("work").join(stem));
     }
-    // The pipeline proper (not yet written): `pipeline::run` returns the exit code.
+    // `pipeline::run` returns the exit code.
     std::process::exit(pipeline::run(args));
 }
 
