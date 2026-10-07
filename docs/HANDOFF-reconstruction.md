@@ -1,6 +1,8 @@
-# Handoff: spend the freed bytes, cheaper patches from pre-deblock reconstruction
+# Handoff: pre-deblock reconstruction, cheaper patches and a byte budget
 
 This brief is for a fresh session. Read `README.md` first, especially "Explicit mode". `docs/HANDOFF.md` and `docs/HANDOFF-anchor-rebuild.md` give the earlier design background.
+
+**This is stage 2 of 2.** It assumes stage 1, `docs/HANDOFF-port-core.md`, is done: the CABAC codec, motion derivation and the per-picture patch work run in a compiled extension (`frame_dedup._native`), with byte-identical output. Build the reconstruction in that extension as well. Per-macroblock motion compensation, intra prediction and transforms are exactly the kind of tight integer loops that are hopeless in pure Python. If stage 1 isn't done, do it first.
 
 ## Where things stand (v1.2.0)
 
@@ -80,7 +82,7 @@ Pieces already there:
 
 Pieces missing:
 - **Explicit weight tables.** `h264hdr.parse_slice` reads `pred_weight_table` but discards the values. Record `luma_log2_weight_denom`, `chroma_log2_weight_denom` and the per-reference weights and offsets. Implicit weights follow from POCs (8.4.2.3).
-- **The reconstruction itself,** in numpy, as a new module `recon.py`.
+- **The reconstruction itself,** in the native extension from stage 1. Its records already hold modes, motion and coefficients, so reconstruction is just another picture-level operation (`pic.reconstruct(ctx, refs)`, where `refs` are the ffmpeg-decoded reference frames). A thin Python wrapper exposes the result as numpy arrays for tests.
 - **A forward transform and quantiser.** Use plain rounding first; trellis or RDO only if the byte cost matters.
 - **Putting a correction into the CABAC records:**
   - set `cbp` and coefficients;
@@ -101,7 +103,11 @@ Their hard drops leave 1-8 levels around PCM patches from deblocking across PCM 
 ## Practicalities
 
 - **Machine:** 32 threads and 31.7 GB of RAM, with a history of crashing under full load. Keep the defaults: half the workers, below-normal priority, and pools sized by `system.pool_size`. Explicit repair workers peaked at 1.1 GB (budget `REPAIR_PEAK_EXPLICIT` = 1.5 GB, so 9 workers). Run one heavy pipeline at a time.
-- **Speed:** the profile of one period is dominated by the Python CABAC parse and encode (about 0.8 s per picture each way) and `derive_motion` (about 0.25 s). Frame diffs are cached across rounds, and pictures whose inputs didn't change are not re-encoded (`patch_pictures(cache=...)`). The reconstruction will add numpy work per affected MB only. Don't reconstruct whole pictures except for validation.
+- **Speed:**
+  - Before stage 1, a repair period was dominated by the Python CABAC parse and encode (about 0.8 s per picture each way) and `derive_motion` (about 0.25 s).
+  - After stage 1, the ffmpeg decodes in the measure loop should dominate. Each round decodes the new period and, for memory, the original again.
+  - Frame diffs are cached across rounds, and pictures whose inputs didn't change are not re-encoded (`patch_pictures(cache=...)`).
+  - Residual corrections are reconstructed per affected MB only; reconstruct whole pictures only for validation.
 - **Test material:**
   - The bitstream tests extract short clips from the MKVs in the repository root.
   - `tests/test_explicit.py` covers explicit mode.
