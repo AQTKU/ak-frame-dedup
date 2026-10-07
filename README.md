@@ -20,12 +20,13 @@ python -m frame_dedup in.mkv -o out.mkv [--report r.json] [--verify]
 | option | meaning |
 |---|---|
 | `-o out.mkv` | output file (written as `out.mkv.partial.mkv`, renamed on success) |
-| `--report r.json` | JSON report: rates, chunks and phases, drops by kind, hard / unsupported pairs, substitutes, repair cost, sync corrections, durations, verify stats, runtime and peak memory |
+| `--report r.json` | JSON report: rates, chunks and phases, drops by kind, hard / unsupported pairs, substitutes, anchor rebuilds and their fallbacks, repair cost, sync corrections, durations, verify stats, runtime and peak memory |
 | `--verify` | decode the output and the original and compare every kept frame by (IDR period, POC) |
 | `--work DIR` | intermediates (default `work/<input name>`). Only the files the tool creates are deleted afterwards; `run.log` stays as a trail |
 | `--keep-work` | keep the intermediates (cached proxy features are reused on the next run) |
 | `--workers N` | worker processes (default: half the logical CPUs) |
-| `--keep-idr-pairs` | see drop rule 6 below |
+| `--no-rebuild` | never rebuild an anchor (drop rule 6 below); IDR-later pairs then use rule 7 |
+| `--keep-idr-pairs` | see drop rule 7 below |
 | `--dry-run` | detect and plan only |
 
 Exit codes:
@@ -125,14 +126,22 @@ Dev tools:
       *invisible substitute*;
    5. otherwise drop the later twin as a **hard drop**, repaired in step 9,
       unless it is an IDR (an IDR is never dropped);
-   6. if the later twin is an IDR, drop the cheap picture within ±3 frames
-      with the least motion instead. This *visible substitute* loses one real
-      frame but keeps A/V sync. `--keep-idr-pairs` keeps both twins instead,
-      as the brief specified;
-   7. if there is no candidate, keep both twins (*unsupported*) and correct
+   6. if the later twin D is an IDR, drop the earlier twin K by an **anchor
+      rebuild** (step 10): D is demoted to a non-IDR I picture that takes
+      K's place. This needs, header-only, K to be a non-IDR reference
+      picture ending the previous IDR period, only non-reference pictures
+      between K and D in decode order, nothing else reading K, and the
+      rewritten stream's reference lists to pass the check in step 10.
+      `--no-rebuild` turns this rule off;
+   7. if the rebuild is not possible, drop the cheap picture within ±3
+      frames with the least motion instead. This *visible substitute* loses
+      one real frame but keeps A/V sync. `--keep-idr-pairs` keeps both twins
+      instead, as the brief specified;
+   8. if there is no candidate, keep both twins (*unsupported*) and correct
       the count at the next black run.
 
-   Rules 1-4 leave every other frame bit-exact.
+   Rules 1-4 leave every other frame bit-exact. Rule 6 changes only the
+   non-reference B pictures that used K as their forward anchor.
 7. **A/V sync**.
    - Kept frame n becomes output frame k at k/fps_out; its offset is
      k − n·r output frames.
@@ -164,20 +173,81 @@ Dev tools:
      exactly: skips become explicit where needed, mvds are re-solved, the QP
      chain is kept, and direct blocks become explicit bi-prediction.
    - Work runs in parallel, one task per IDR period.
-10. **Mux** with mkvmerge:
+10. **Anchor rebuilds** (`rebuild.py`), a third pass over the repaired
+    stream. For a pair whose earlier twin K (a P) is the forward anchor of
+    the B pictures before it and whose later twin D is an IDR:
+
+    ```
+    display:  P0  B1 B2 B3  K | D(IDR)  b b b  P ...
+    decode:   P0 ... K  B1 B2 B3  D  P  b b b ...
+    ```
+
+    - **Demote D.** `nal_unit_type` 5 becomes 1 (`nal_ref_idc` kept), the
+      slice header loses `idr_pic_id`, and the IDR form of
+      `dec_ref_pic_marking` becomes `adaptive_ref_pic_marking_mode_flag = 0`.
+      The header is rebuilt bit by bit and padded with
+      `cabac_alignment_one_bit`s, and the original CABAC slice-data bytes are
+      appended unchanged (they depend only on slice QP and slice type). The
+      result, I2, decodes bit-identical to D.
+    - **Move it into K's slot.** K is dropped and I2 is written in K's
+      decode position, behind D's SPS / PPS and a recovery point SEI. I2
+      carries K's `frame_num` and K's POC, so B1-B3 find their anchor at the
+      same list positions and POC distances.
+    - **Merge the IDR periods.** Every POC of D's former period is shifted
+      by POC(K) − POC(D), and `frame_num` continues from K's (it is
+      re-derived as PrevRefFrameNum + 1 for every picture; the inputs have no
+      `frame_num` gaps). POC differences inside the period are unchanged, so
+      its direct modes and implicit weights are too. Both fields are
+      fixed-width and patched in place. Chains of consecutive rebuilds merge
+      several periods.
+    - **List check.** The decoded picture buffer is no longer flushed at D,
+      so older pictures linger in it. The reference lists of the rewritten
+      stream are simulated from headers (`dpb_walk`): every entry the
+      original could use must still point at the same picture. Lingering
+      pictures only ever extend a list beyond the entries the original had.
+      The check runs per pair while planning (a failure falls back to rule
+      7), again over the whole stream before writing, and the written stream
+      is re-parsed and compared with the plan.
+    - **Repair B1-B3.** They are non-reference pictures, so nothing they
+      contain propagates. Their temporal-direct blocks took motion from K's
+      motion field; I2 is all intra, so every direct block whose motion would
+      change is rewritten as explicit prediction with the original motion,
+      using the coarsest partitioning that fits (16x16, 16x8, 8x16, else
+      8x8), and the mvds are re-solved. Their reads of K now read I2, a second
+      encode of the same frame. The pair's segment is decoded and every
+      macroblock that differs from the original by 16 levels or more
+      (`PCM_THRESHOLD`, max over Y/U/V) becomes I_PCM, worst first, repeating
+      until no new macroblock crosses the threshold. At most 2% of a picture
+      (`PCM_MAX_FRACTION`, 163 MBs at 1080p) is patched, so fast-motion pairs,
+      where the IDR twin is coded very differently from K, do not turn into
+      whole PCM pictures. Smaller differences are encode noise and are
+      accepted.
+    - **Seeking.** I2 is no longer an IDR. A recovery point SEI in front of
+      it (`recovery_frame_cnt = 0`, `exact_match_flag = 1`,
+      `broken_link_flag = 0`) keeps it a random-access point, i.e. an open
+      GOP. B1-B3 are its leading pictures and also read P0, so they cannot
+      be decoded after a seek straight to I2; decoders skip them.
+    - Work runs in parallel, one task per pair.
+11. **Mux** with mkvmerge:
     `--default-duration 0:24000/1001p|24p|25p out.h264 --no-video in.mkv`,
     plus the original video track's language, name, flags and display
     dimensions, and the segment title.
-11. **Duration check**: the output video's duration must match the input
+12. **Duration check**: the output video's duration must match the input
     video's within one output frame, so the input's own video-to-audio gap
     is preserved. Both gaps are reported.
-12. **Verify**.
-    - Original and output are decoded uncropped at full resolution and
-      matched by (IDR period, POC).
+13. **Verify**.
+    - Original and output are decoded uncropped at full resolution. Every
+      output picture is matched with its original by the original's (IDR
+      period, POC); the pipeline knows which original each output picture
+      came from, including I2 (it is D) and the shifted POCs of merged
+      periods. Decoding is split into groups of output IDR periods, each
+      covering whole original periods.
     - It reports bit-exact frames, differing frames, the worst difference
       and MBs differing by 3 or more, over Y, U and V and also luma only.
-    - Everything outside hard-drop neighbourhoods must be bit-exact. A
-      neighbourhood runs from the dropped twin to the end of its IDR period.
+    - Everything outside hard-drop neighbourhoods and the leading B
+      pictures of rebuilt pairs must be bit-exact. A hard-drop neighbourhood
+      runs from the dropped twin to the end of its IDR period. The leading B
+      pictures are reported separately (`verify.rebuild_leading_b`).
 
 ### Modules
 
@@ -187,6 +257,7 @@ Dev tools:
 | `h264cabac.py` | CABAC slice-data codec (decode and encode through one code path, I_PCM included); byte-exact round trip |
 | `h264mv.py` | `dpb_walk` (POC, sliding-window ref lists) and `derive_motion` (P_Skip, temporal direct, mvd solving) |
 | `patch.py` | I_PCM macroblock patcher that keeps the rest of the picture exact (`patch_pictures` runs on a subset in a worker) |
+| `rebuild.py` | anchor rebuild: IDR demotion, period merging, list check, B1-B3 repair, recovery point SEI |
 | `roundtrip_test.py`, `verify_motion.py` | CABAC round trip; motion re-expression test |
 | `evidence.py`, `cadence.py`, `plan.py` | detection and drop planning |
 | `stream.py`, `repair.py`, `decode.py`, `verify.py`, `mux.py`, `pipeline.py`, `__main__.py` | the pipeline |
@@ -218,8 +289,11 @@ ffmpeg decoders once crashed a machine with marginal RAM.
 Measured on the four test files on a 32-thread / 31.7 GB machine with
 default settings:
 - Every run used `--verify`.
-- Times are wall-clock. The sample and smoke runs reused cached proxy
-  features, which cost about 43 s and 100 s fresh.
+- Times are wall-clock. The sample run reused cached proxy features, which
+  cost about 43 s fresh; the smoke run includes its 100 s proxy decode.
+- foliage and sample have no IDR-later pairs, so the anchor rebuild never
+  runs on them: their outputs are packet-for-packet identical to version
+  1.0's (per-stream MD5 over video, audio and subtitles).
 - Differences are max absolute over Y/U/V, with luma-only in brackets.
 
 | | foliage.mkv | sample.mkv | smoke.mkv | nodupes.mkv |
@@ -231,21 +305,36 @@ default settings:
 | drops | 15,878 | 7,793 | 15,886 | |
 | hard pairs (repaired) | 93 | 26 | 53 | |
 | unreferenced reference twins dropped | 0 | 1 | 302 | |
-| substitutes (invisible / visible) | 0 / 0 | 0 / 0 | 2 / 300 | |
+| substitutes (invisible / visible) | 0 / 0 | 0 / 0 | 2 / 0 (1.0: 2 / 300) | |
+| anchor rebuilds (fallbacks) | 0 | 0 | 300 (0) | |
 | unsupported pairs | 0 | 0 | 0 | |
 | sync corrections | 0 | 0 | 3 | |
-| PCM MBs / bytes added | 84 / +31.7 KB | 140 / +53.1 KB | 170 / +65.2 KB | |
-| verify: bit-exact / differing frames | 63,286 / 226 | 30,920 / 249 | 63,282 / 262 | |
-| worst difference | 7 (luma 6) | 5 (luma 5) | 8 (luma 8) | |
-| MBs differing by 3 or more | 465 (luma 268) | 631 (luma 352) | 270 (luma 131) | |
-| differing outside hard-drop neighbourhoods | 0 | 0 | 0 | |
+| hard-drop repair: PCM MBs / bytes added | 84 / +31.7 KB | 140 / +53.1 KB | 177 / +66.3 KB | |
+| rebuild: leading B pictures / PCM MBs | | | 592 / 19,205 (40 pictures at the 2% cap) | |
+| rebuild: bytes added (output size vs 1.0) | | | +12.3 MB (+0.58 MB: K is a P, the old substitutes were Bs) | |
+| verify: bit-exact / differing frames | 63,286 / 226 | 30,920 / 249 | 62,707 / 837 | |
+| hard-drop neighbourhoods: differing frames, worst difference | 226, 7 (luma 6) | 249, 5 (luma 5) | 245, 8 (luma 8) | |
+| hard-drop neighbourhoods: MBs differing by 3 or more | 465 (luma 268) | 631 (luma 352) | 270 (luma 131) | |
+| rebuilt leading B pictures: differing, worst difference | | | 592 of 592; worst 56, median per picture 15; 552 below 16 | |
+| rebuilt leading B pictures: MBs differing by 3 or more | | | 1,805,319 (median 2,791 of 8,160 per picture: encode noise) | |
+| differing anywhere else | 0 | 0 | 0 | |
 | video − audio duration, in → out | +0.019 → +0.020 s | −0.088 → −0.089 s | +0.052 → +0.011 s | |
 | A/V mean offset / max offset | −0.35 / 0.8 frames | −0.35 / 0.8 frames | +0.24 / 1.4 frames | |
-| runtime | 360 s | 125 s (+43 s) | 255 s (+100 s) | 50 s |
-| peak RSS: main / worker | 2.1 GB / 0.25 GB | 1.0 GB / 0.26 GB | 2.1 GB / 0.34 GB | 1.0 GB |
+| runtime | 349 s | 172 s | 579 s (rebuild 180 s, verify 267 s) | 50 s |
+| peak RSS: main / worker | 2.1 GB / 0.25 GB | 1.0 GB / 0.26 GB | 2.4 GB / 0.25 GB | 1.0 GB |
 
 System load during these runs: CPU peaked at 80-84% (mean 51-68%), and
 available RAM never dropped below 13.3 GB of 31.7 GB.
+
+Seeking on smoke.mkv's output: it has 883 keyframes, one per original IDR
+period (583 IDRs and 300 rebuilt I2s; version 1.0 also had 883, and
+mkvmerge does not flag plain non-IDR I pictures, so the recovery point SEI is
+what makes I2 a keyframe). At five rebuilt pairs spread over the file
+(24 s to 2360 s), `ffmpeg -ss` straight to I2 returns frames identical to a
+continuous decode from the previous real IDR, and a seek 60 ms earlier, into
+the leading B pictures, lands on the previous keyframe and is exact too. A
+raw decode starting at I2's byte offset also reproduces every frame from I2
+on (`tests/test_rebuild.py`).
 
 Raw-stream check: the output's SPS signals 1001/48000, and ffprobe reports
 `tbr 47.95` for it, just as it reports 59.94 for the 29.97 input. mkvmerge,
@@ -270,14 +359,17 @@ given only the raw output stream with no `--default-duration`, infers
     runs to absorb it.
   - In about half of these pairs the earlier twin is a P that nothing reads,
     because the IDR flushes the DPB. Rule 3 drops it bit-exactly.
-  - In the other half the P is the backward anchor of the two B-frames before
-    it. Dropping either twin would cost whole pictures of PCM, so rule 6
-    drops the least-motion nearby B-frame instead.
-  - Result on smoke.mkv: 0 unsupported pairs, the A/V gap changes by
-    −0.041 s, and 300 visible substitutes.
-  - The alternative, converting the IDR into a non-IDR I picture and merging
-    GOPs, was rejected. It would remove the stream's random-access points
-    for minutes at a time, and every reader of the IDR would need patching.
+  - In the other half the P is the forward anchor of the B-frames displayed
+    before it. Version 1.0 dropped the least-motion nearby B-frame instead
+    (a *visible substitute*, 300 on smoke.mkv). Each one caused two
+    artefacts, a skipped frame and a frame held too long, i.e. more judder.
+  - The anchor rebuild (rule 6, step 10) now drops K itself, the actual
+    duplicate. An earlier objection to demoting the IDR was that it would
+    remove random-access points and that every reader of the IDR would need
+    patching. Neither holds: a recovery point SEI keeps I2 a random-access
+    point (mkvmerge flags it as a keyframe, and decoding from it is exact),
+    and nothing reads I2 differently from how it read D. Only the leading B
+    pictures that read K change, and they are not references.
 - **Pixel-aware sniffing and invisible substitutes.** A predicted pair
   (P, I) at the start of a black run, where the phase changes, is not a
   real duplicate. A pure ref-change test there PCM-patched four entire
@@ -320,10 +412,18 @@ given only the raw output stream with no `--default-duration`, infers
   They come from deblocking across PCM edges, and from intra prediction and
   later references that read post-deblock PCM pixels. They cannot be
   removed without the tool's own pre-deblock reconstruction.
-- A visible substitute (rule 6) drops one real frame next to a duplicate
-  that had to be kept: a one-frame stutter. smoke.mkv has 300 of these;
-  the median dropped frame has a proxy MAD of 1.5, i.e. low motion.
-  `--keep-idr-pairs` keeps both twins instead and accepts A/V drift.
+- An anchor rebuild changes the B pictures displayed just before the pair:
+  they now read I2, a second encode of K's frame. Differences are
+  encode-noise level, except in fast motion, where the IDR twin can be coded
+  very differently from K. There the per-picture PCM budget (2% of the MBs)
+  leaves some MBs at up to about 40 levels (see Results).
+- After a rebuild, I2 is an open-GOP random-access point rather than an
+  IDR. A seek to it skips its leading B pictures, as with any open GOP.
+  A player that seeks only to IDRs lands on the previous real IDR.
+- A visible substitute (rule 7) is only used when a rebuild is not possible.
+  It drops one real frame next to a duplicate that had to be kept: a
+  one-frame stutter. `--keep-idr-pairs` keeps both twins instead and accepts
+  A/V drift.
 - A file with no black run of 0.5 s or more cannot correct the sync offset
   after a mid-chunk phase change or an unsupported pair. The offset is
   reported.
