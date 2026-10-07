@@ -9,8 +9,12 @@ pub fn main(args: &[String]) -> Result<()> {
     let Some((cmd, rest)) = args.split_first() else {
         bail!("usage: frame-dedup dev <command> [args...]");
     };
-    let _ = rest;
     match cmd.as_str() {
+        "features" => crate::evidence::dev_features(rest),
+        "features-raw" => crate::evidence::dev_features_raw(rest),
+        "train-llr" => crate::evidence::dev_train_llr(rest),
+        "detect" => crate::cadence::dev_detect(rest),
+        "plan" => crate::plan::dev_plan(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }
