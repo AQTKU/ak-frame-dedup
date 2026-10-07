@@ -1,5 +1,5 @@
 # End-to-end acceptance runs of the Rust build against the v1.2.0 baselines.
-# Usage: pwsh port/e2e.ps1 [names...]   (one at a time; per-stream MD5 compared)
+# Usage: pwsh tools/e2e.ps1 [names...]   (one at a time; per-stream MD5 compared)
 param([string[]]$Names = @('smoke', 'foliage', 'full'))
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root

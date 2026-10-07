@@ -1,7 +1,6 @@
 //! `frame-dedup dev <command> ...`: developer subcommands that dump
-//! intermediate results as JSON for comparison with the Python oracle
-//! (port/oracle.py). Each command lives in the module it exercises; this is
-//! only the dispatch table.
+//! intermediate results as JSON. Each command lives in the module it
+//! exercises; this is only the dispatch table.
 
 use anyhow::{Result, bail};
 

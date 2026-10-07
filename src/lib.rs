@@ -25,4 +25,4 @@ pub mod stream;
 pub mod system;
 pub mod verify;
 
-pub const VERSION: &str = "2.0.0-dev";
+pub const VERSION: &str = "2.0.0";

@@ -2,7 +2,7 @@
 
 This brief is for a fresh session. Read `README.md` first, especially "Explicit mode". `docs/HANDOFF.md` and `docs/HANDOFF-anchor-rebuild.md` give the earlier design background.
 
-**This is stage 2 of 2.** It assumes stage 1, `docs/HANDOFF-port-core.md`, is done: the CABAC codec, motion derivation and the per-picture patch work run in a compiled extension (`frame_dedup._native`), with byte-identical output. Build the reconstruction in that extension as well. Per-macroblock motion compensation, intra prediction and transforms are exactly the kind of tight integer loops that are hopeless in pure Python. If stage 1 isn't done, do it first.
+**Stage 1 (the port of the core) is done:** since 2.0.0 the whole tool is Rust, byte-identical to Python v1.2.0. This brief was written against the Python modules; their Rust counterparts keep the same names (`h264cabac.py` → `src/cabac.rs`, `h264mv.py` → `src/mv.rs` and `src/reexpress.rs`, `patch.py` → `src/patch.rs`, `repair.py` → `src/repair.rs`, `explicit.py` → `src/explicit.rs`, `h264hdr.py` → `src/h264hdr.rs`). Build the reconstruction in Rust too. The Python tests mentioned below were removed with the Python code.
 
 ## Where things stand (v1.2.0)
 

@@ -46,7 +46,9 @@ Requirements:
 
 Tests: `cargo test --release`. The oracle tests in `tests/` compare with
 cached outputs of the Python v1.2.0 implementation under `work/port/oracle/`
-and skip when those are missing.
+and skip when those are missing. The Python implementation and its oracle
+tooling were removed in 2.0.0; they remain in git history (commit
+`571a346`).
 
 Dev tools (`frame-dedup dev <command>`):
 - `train-model sample.mkv` retrains the likelihood tables
@@ -544,7 +546,7 @@ given only the raw output stream with no `--default-duration`, infers
 - **Resource defaults** (see above) were added after a crash under full
   load.
 - `refine.py`, `dedup.py` and `drop_test.py` were removed; they remain in
-  git history.
+  git history. So does the whole Python implementation, removed in 2.0.0.
 
 ## Limitations
 
