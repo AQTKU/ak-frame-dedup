@@ -242,6 +242,7 @@ def repair(orig_es, new_es, spss, ppss, pics, new_pics, drop, workers, log=print
                 log(f'  [{i + 1}/{len(tasks)}] IDR period {r["period"]}: {len(r["repl"])} pictures rewritten, '
                     f'{n_pcm} PCM MBs ({r["seconds"]} s)')
     repl = {}
+    orig_of_new = {v: k for k, v in new_of.items()}
     summary = {'candidate_pictures': len(cands), 'periods': len(tasks), 'pictures_rewritten': 0,
                'pcm_mbs': 0, 'bytes_added': 0, 'skip_to_explicit': 0, 'direct_to_explicit': 0,
                'qp_carriers': 0, 'workers': nproc,
@@ -257,5 +258,6 @@ def repair(orig_es, new_es, spss, ppss, pics, new_pics, drop, workers, log=print
             summary['skip_to_explicit'] += s['skip_explicit']
             summary['direct_to_explicit'] += s['direct_explicit']
             summary['qp_carriers'] += s['qp_carrier']
-            summary['pictures'].append({'out_dec': nd, 'display': new_pics[nd]['disp'], **s})
+            summary['pictures'].append({'out_dec': nd, 'out_display': new_pics[nd]['disp'],
+                                        'in_display': pics[orig_of_new[nd]]['disp'], **s})
     return repl, summary
