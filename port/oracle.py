@@ -471,5 +471,157 @@ def maxdiff(path, mb_w, mb_h, cl, cr, ct, cb, i, j):
     print(text({'mb': m.ravel().tolist(), 'luma': ly.ravel().tolist(), 'visible': vis.ravel().tolist()}))
 
 
+def _picture_args(rest):
+    """[--from N] [--count N] [--full] after the file name."""
+    opts, it = {'from': 0, 'count': None, 'full': False}, iter(rest)
+    pos = []
+    for a in it:
+        if a == '--from':
+            opts['from'] = int(next(it))
+        elif a == '--count':
+            opts['count'] = int(next(it))
+        elif a == '--full':
+            opts['full'] = True
+        elif a == '--threads':
+            next(it)  # accepted for symmetry with the Rust command
+        else:
+            pos.append(a)
+    return opts, pos
+
+
+def _open_pictures(path, opts):
+    import mmap
+    from frame_dedup.stream import load
+    spss, ppss, pics = load(path)
+    f = open(path, 'rb')
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    a = min(opts['from'], len(pics))
+    b = len(pics) if opts['count'] is None else min(a + opts['count'], len(pics))
+    return mm, spss, ppss, pics, range(a, b)
+
+
+@command
+def records(path, *rest):
+    """records <file.h264> [--from N] [--count N] [--full]: per picture, the digest of the
+    canonical macroblock records (CABAC parse)."""
+    import sys
+    import time
+    from frame_dedup.roundtrip_test import decode_picture
+    from .canon import canon_mbs, digest, text
+    opts, _ = _picture_args(rest)
+    mm, spss, ppss, pics, rng = _open_pictures(path, opts)
+    t0 = time.time()
+    for i in rng:
+        p = pics[i]
+        d = decode_picture(mm, spss, ppss, p)
+        c = canon_mbs(d['mbs'])
+        line = {'dec': p['dec'], 'type': p['type'], 'n_mbs': len(c), 'digest': digest(c)}
+        if opts['full']:
+            line['mbs'] = c
+        print(text(line), flush=True)
+    print(f'records: {len(rng)} pictures in {time.time() - t0:.2f}s', file=sys.stderr)
+
+
+@command
+def roundtrip(path, *rest):
+    """roundtrip <file.h264> [--from N] [--count N]: roundtrip_test.check for each picture."""
+    import sys
+    import time
+    from frame_dedup.roundtrip_test import decode_picture, encode_picture
+    from .canon import text
+    opts, _ = _picture_args(rest)
+    mm, spss, ppss, pics, rng = _open_pictures(path, opts)
+    ok_n, bad, dec_s, enc_s = 0, [], 0.0, 0.0
+    for i in rng:
+        p = pics[i]
+        t0 = time.time()
+        d = decode_picture(mm, spss, ppss, p)
+        t1 = time.time()
+        sl = d['sl']
+        tail = d['bits'][d['end']:]
+        stop_ok = d['bits'][d['end'] - 1] == 1 and not any(tail)
+        late_stop = (not stop_ok) and d['end'] < len(d['bits']) and d['bits'][d['end']] == 1 and not any(d['bits'][d['end'] + 1:])
+        nal2, enc_bits = encode_picture(d)
+        t2 = time.time()
+        same_bits = enc_bits == d['bits'][sl['data_bit']:d['end']]
+        same_nal = nal2 == d['nal']
+        dec_s += t1 - t0
+        enc_s += t2 - t1
+        if stop_ok and same_bits and same_nal:
+            ok_n += 1
+        else:
+            bad.append(p['dec'])
+        print(text({'dec': p['dec'], 'type': p['type'], 'nal_len': len(d['nal']), 'stop_bit_ok': stop_ok,
+                    'tail_bits': len(tail), 'bits_equal': same_bits, 'nal_equal': same_nal,
+                    'late_stop_bit': late_stop}), flush=True)
+    print(text({'summary': True, 'pictures': len(rng), 'ok': ok_n, 'failed': len(bad), 'failed_dec': bad}))
+    n = max(len(rng), 1)
+    print(f'roundtrip: mean decode {dec_s / n * 1e3:.1f} ms, mean encode {enc_s / n * 1e3:.1f} ms', file=sys.stderr)
+
+
+class SplitMix64:
+    M = (1 << 64) - 1
+
+    def __init__(self, seed):
+        self.s = seed & self.M
+
+    def next(self):
+        self.s = (self.s + 0x9E3779B97F4A7C15) & self.M
+        z = self.s
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & self.M
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & self.M
+        return z ^ (z >> 31)
+
+
+def apply_edit(mbs, t, w, seed):
+    """The deterministic edit spec of `encode-edited` (same as picture.rs `apply_edit`)."""
+    from frame_dedup.patch import to_explicit
+    rng = SplitMix64(seed)
+    period = 6 + seed % 29
+    counts = [0, 0, 0, 0]
+    for i, mb in enumerate(mbs):
+        r = rng.next()
+        x, y = i % w, i // w
+        if r % period == 0:
+            mbs[i] = {'skip': 0, 'kind': 'PCM', 'samples': [(x * 31 + y * 17 + j * 7 + seed) & 255 for j in range(384)],
+                      'intra': 1, 'pcm': 1, 'i16': 0, 'direct16': 0, 'cbp': 0x2f, 't8': 0, 'cmode': 0, 'qpd': 0}
+            counts[0] += 1
+        elif t == 'P' and mb['skip'] and (r >> 20) % 6 == 0:
+            mbs[i] = to_explicit(mb, 'P', None)
+            counts[1] += 1
+        elif t == 'B' and mb['skip'] and (r >> 20) % 6 == 0:
+            mb.update(skip=0, kind='B', btype=0, part='D', direct16=1, cbp=0, t8=0, qpd=0, coef={})
+            counts[1] += 1
+        elif not mb['skip'] and mb['cbp'] == 0 and mb['kind'] != 'I16' and (r >> 32) % 4 == 0:
+            mb['cbp'] |= 0x10
+            mb.setdefault('coef', {})
+            mb['qpd'] = ((r >> 40) % 5) - 2
+            counts[2] += 1
+        elif not mb['skip'] and (mb['cbp'] != 0 or mb['kind'] == 'I16') and (r >> 48) % 9 == 0:
+            mb['qpd'] = ((r >> 52) % 7) - 3
+            counts[3] += 1
+    return counts
+
+
+@command
+def encode_edited(path, *pairs):
+    """encode-edited <file.h264> <dec> <seed> [<dec> <seed> ...]: decode picture dec, apply the
+    deterministic edit, encode; one line per (dec, seed)."""
+    import hashlib
+    from frame_dedup.roundtrip_test import decode_picture, encode_picture
+    from .canon import text
+    mm, spss, ppss, pics, _ = _open_pictures(path, {'from': 0, 'count': None})
+    for k in range(0, len(pairs), 2):
+        dec, seed = int(pairs[k]), int(pairs[k + 1])
+        p = pics[dec]
+        d = decode_picture(mm, spss, ppss, p)
+        mbs = d['mbs']
+        counts = apply_edit(mbs, d['sl']['slice_type'], d['sps']['mb_w'], seed)
+        nal, _ = encode_picture(d, mbs)
+        print(text({'dec': dec, 'seed': seed, 'type': p['type'], 'len': len(nal),
+                    'sha256': hashlib.sha256(nal).hexdigest(), 'pcm': counts[0], 'explicit': counts[1],
+                    'empty_dc': counts[2], 'qpd': counts[3]}), flush=True)
+
+
 if __name__ == '__main__':
     main(sys.argv[1:])
