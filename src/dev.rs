@@ -16,6 +16,9 @@ pub fn main(args: &[String]) -> Result<()> {
         "sysinfo" => crate::system::dev_sysinfo(),
         "headers" => crate::stream::dev_headers(rest),
         "escape" => crate::stream::dev_escape(rest),
+        "records" => crate::picture::dev_records(rest),
+        "roundtrip" => crate::picture::dev_roundtrip(rest),
+        "encode-edited" => crate::picture::dev_encode_edited(rest),
         "patch-sps" => crate::stream::dev_patch_sps(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
