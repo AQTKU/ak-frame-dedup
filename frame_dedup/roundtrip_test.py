@@ -7,8 +7,8 @@ import mmap
 import sys
 import time
 
-from h264cabac import Coder, SliceCodec
-from h264hdr import escape, parse_stream, unescape
+from .h264cabac import Coder, SliceCodec
+from .h264hdr import escape, parse_stream, unescape
 
 
 def to_bits(b):

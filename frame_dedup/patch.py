@@ -21,10 +21,10 @@ import mmap
 import os
 import sys
 
-from h264hdr import parse_stream
-from h264mv import derive_motion, dpb_walk
-from roundtrip_test import decode_picture, encode_picture
-from verify_motion import reexpress
+from .h264hdr import parse_stream
+from .h264mv import derive_motion, dpb_walk
+from .roundtrip_test import decode_picture, encode_picture
+from .verify_motion import reexpress
 
 
 def pcm_record(yuv, W, mbx, mby):
@@ -113,10 +113,26 @@ def patch_stream(es, patches, yuv_of, out_path, log=print):
     bytes holding the target pixels of picture d."""
     spss, ppss, pics = parse_stream(es)
     dpb_walk(spss, pics)
-    sps = spss[0]
-    W, H = sps['mb_w'], sps['mb_h']
     f = open(es, 'rb')
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    repl = patch_pictures(mm, spss, ppss, pics, patches, yuv_of, log)
+    write_patched(mm, pics, repl, out_path)
+    log(f'wrote {out_path}: {len(repl)} pictures rewritten')
+    return repl
+
+
+def _has(pics, k):
+    return k in pics if isinstance(pics, dict) else 0 <= k < len(pics)
+
+
+def patch_pictures(mm, spss, ppss, pics, patches, yuv_of, log=print, parsed=None, stats=None):
+    """Compute replacement slice NALs for the patched pictures.
+    pics: pictures indexable by decode index (a list, or a dict holding at
+    least the patched pictures, their reference pictures and following B
+    pictures), after dpb_walk. parsed: optional cache {dec: (decoded picture,
+    motion)}. Returns {dec: new NAL bytes}."""
+    sps = spss[0]
+    W, H = sps['mb_w'], sps['mb_h']
 
     # pictures to rewrite: patched ones, plus B pictures that use a patched
     # P picture as co-located picture (they follow it in decode order)
@@ -124,12 +140,13 @@ def patch_stream(es, patches, yuv_of, out_path, log=print):
     for d in patches:
         if pics[d]['slices'][0]['slice_type'] == 'P':
             k = d + 1
-            while k < len(pics) and pics[k]['slices'][0]['slice_type'] == 'B':
+            while _has(pics, k) and pics[k]['slices'][0]['slice_type'] == 'B':
                 if pics[k]['lists'][1][0] == d:
                     todo.add(k)
                 k += 1
 
-    new_motion, repl, parsed = {}, {}, {}
+    new_motion, repl = {}, {}
+    parsed = {} if parsed is None else parsed
 
     def load(d):
         if d not in parsed:
@@ -206,7 +223,13 @@ def patch_stream(es, patches, yuv_of, out_path, log=print):
         repl[d] = nal
         log(f"dec {d} {t}: PCM {len(targets)} MB, direct->explicit {n_direct}, skip->explicit {n_skip}, "
               f"qp-carrier {forced}; {len(dd['nal'])}B -> {len(nal)}B")
+        if stats is not None:
+            stats[d] = dict(type=t, pcm=len(targets), direct_explicit=n_direct, skip_explicit=n_skip,
+                            qp_carrier=forced, bytes_before=len(dd['nal']), bytes_after=len(nal))
+    return repl
 
+
+def write_patched(mm, pics, repl, out_path):
     with open(out_path, 'wb') as o:
         pos = 0
         for p in pics:
@@ -221,8 +244,6 @@ def patch_stream(es, patches, yuv_of, out_path, log=print):
                 o.write(mm[s0:sl['offset'] + sl['size']])
             pos = sl['offset'] + sl['size']
         o.write(mm[pos:])
-    log(f'wrote {out_path}: {len(repl)} pictures rewritten')
-    return repl
 
 
 if __name__ == '__main__':

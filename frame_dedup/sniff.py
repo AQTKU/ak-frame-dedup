@@ -11,8 +11,8 @@ The taint map is what dropping D (so D-readers read K instead) can disturb.
 """
 import numpy as np
 
-from h264mv import derive_motion
-from roundtrip_test import decode_picture
+from .h264mv import derive_motion
+from .roundtrip_test import decode_picture
 
 
 def footprint(gx, gy, mv, W, H):

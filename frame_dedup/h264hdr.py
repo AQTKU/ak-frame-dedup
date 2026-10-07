@@ -93,7 +93,87 @@ def parse_sps(rbsp):
     if not s['frame_mbs_only']:
         s['mbaff'] = b.u(1)
     s['direct_8x8_inference'] = b.u(1)
+    s['crop'] = (0, 0, 0, 0)
+    if b.u(1):  # frame_cropping_flag
+        s['crop'] = (b.ue(), b.ue(), b.ue(), b.ue())  # left, right, top, bottom
+    s['vui'] = parse_vui(b) if b.u(1) else None
     return s
+
+
+def _hrd(b):
+    h = {'cpb_cnt': b.ue() + 1, 'bit_rate_scale': b.u(4), 'cpb_size_scale': b.u(4), 'sched': []}
+    for _ in range(h['cpb_cnt']):
+        h['sched'].append((b.ue(), b.ue(), b.u(1)))
+    h['init_cpb_delay_len'] = b.u(5) + 1
+    h['cpb_removal_delay_len'] = b.u(5) + 1
+    h['dpb_output_delay_len'] = b.u(5) + 1
+    h['time_offset_len'] = b.u(5)
+    return h
+
+
+def parse_vui(b):
+    """vui_parameters() (Annex E.1.1). Records the bit offsets of the timing
+    fields so they can be patched in place."""
+    v = {}
+    if b.u(1):  # aspect_ratio_info_present
+        v['aspect_ratio_idc'] = b.u(8)
+        if v['aspect_ratio_idc'] == 255:
+            v['sar'] = (b.u(16), b.u(16))
+    if b.u(1):  # overscan_info_present
+        v['overscan_appropriate'] = b.u(1)
+    if b.u(1):  # video_signal_type_present
+        v['video_format'] = b.u(3)
+        v['full_range'] = b.u(1)
+        if b.u(1):
+            v['colour'] = (b.u(8), b.u(8), b.u(8))
+    if b.u(1):  # chroma_loc_info_present
+        v['chroma_loc'] = (b.ue(), b.ue())
+    v['timing'] = None
+    if b.u(1):  # timing_info_present
+        pos = b.p
+        v['timing'] = {'num_units_in_tick': b.u(32), 'time_scale': b.u(32), 'fixed_frame_rate': b.u(1),
+                       'bit': pos}
+    v['nal_hrd'] = _hrd(b) if b.u(1) else None
+    v['vcl_hrd'] = _hrd(b) if b.u(1) else None
+    if v['nal_hrd'] or v['vcl_hrd']:
+        v['low_delay_hrd'] = b.u(1)
+    v['pic_struct_present'] = b.u(1)
+    v['bitstream_restriction'] = None
+    if b.u(1):
+        v['bitstream_restriction'] = {
+            'mv_over_pic_boundaries': b.u(1), 'max_bytes_per_pic_denom': b.ue(),
+            'max_bits_per_mb_denom': b.ue(), 'log2_max_mv_length_h': b.ue(),
+            'log2_max_mv_length_v': b.ue(), 'max_num_reorder_frames': b.ue(),
+            'max_dec_frame_buffering': b.ue()}
+    v['end_bit'] = b.p
+    return v
+
+
+def sps_frame_rate(sps):
+    """Frame rate signalled by the SPS VUI as (num, den), or None.
+    For progressive frames one frame lasts two ticks: fps = time_scale / (2 * num_units_in_tick)."""
+    t = (sps.get('vui') or {}).get('timing')
+    if not t or not t['num_units_in_tick'] or not t['time_scale']:
+        return None
+    return t['time_scale'], 2 * t['num_units_in_tick']
+
+
+def patch_sps_timing(nal, num_units_in_tick, time_scale):
+    """Return the SPS NAL (header byte + escaped payload) with its VUI timing
+    fields overwritten in place. The fields are fixed-width u(32), so the
+    RBSP keeps its length; only emulation prevention can change."""
+    rbsp = bytearray(unescape(bytes(nal[1:])))
+    sps = parse_sps(bytes(rbsp))
+    t = (sps.get('vui') or {}).get('timing')
+    if t is None:
+        raise ValueError('SPS has no VUI timing_info; in-place timing patch impossible')
+    set_bits(rbsp, t['bit'], 32, num_units_in_tick)
+    set_bits(rbsp, t['bit'] + 32, 32, time_scale)
+    chk = parse_sps(bytes(rbsp))
+    assert chk['vui']['timing']['num_units_in_tick'] == num_units_in_tick
+    assert chk['vui']['timing']['time_scale'] == time_scale
+    assert chk['vui']['end_bit'] == sps['vui']['end_bit']
+    return bytes(nal[:1]) + escape(bytes(rbsp))
 
 
 def parse_pps(rbsp):

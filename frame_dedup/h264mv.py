@@ -8,7 +8,7 @@
   reference picture ids and motion vectors, including P_Skip and temporal
   direct (B_Skip / B_Direct_16x16 / B_Direct_8x8, direct_8x8_inference).
 """
-from h264cabac import B_SUB, B_TYPES, P_SUB, mb_parts, sub_parts, uses
+from .h264cabac import B_SUB, B_TYPES, P_SUB, mb_parts, sub_parts, uses
 
 
 def dpb_walk(spss, pics):

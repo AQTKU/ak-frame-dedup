@@ -13,10 +13,10 @@ import mmap
 import subprocess
 import sys
 
-from h264cabac import B_SUB, P_SUB
-from h264hdr import parse_stream
-from h264mv import derive_motion, dpb_walk
-from roundtrip_test import decode_picture, encode_picture
+from .h264cabac import B_SUB, P_SUB
+from .h264hdr import parse_stream
+from .h264mv import derive_motion, dpb_walk
+from .roundtrip_test import decode_picture, encode_picture
 
 B_SUB_FOR = {'L0': 1, 'L1': 2, 'Bi': 3}
 
