@@ -12,9 +12,10 @@ one in every five for 23.976 to 29.97.
 ## Usage
 
 ```
-python -m frame_dedup in.mkv -o out.mkv [--report r.json] [--verify]
-                         [--work DIR] [--keep-work] [--workers N]
-                         [--keep-idr-pairs] [--dry-run]
+frame-dedup in.mkv -o out.mkv [--report r.json] [--verify]
+            [--mb-report mb.json [--mb-threshold N]]
+            [--work DIR] [--keep-work] [--workers N]
+            [--no-rebuild] [--keep-idr-pairs] [--dry-run]
 ```
 
 | option | meaning |
@@ -22,49 +23,55 @@ python -m frame_dedup in.mkv -o out.mkv [--report r.json] [--verify]
 | `-o out.mkv` | output file (written as `out.mkv.partial.mkv`, renamed on success) |
 | `--report r.json` | JSON report: rates, chunks and phases, drops by kind, hard / unsupported pairs, substitutes, anchor rebuilds and their fallbacks, repair cost, sync corrections, durations, verify stats, runtime and peak memory |
 | `--verify` | decode the output and the original and compare every kept frame by (IDR period, POC) |
+| `--mb-report mb.json` | with `--verify`: every differing frame (output and input frame number and time, IDR period, POC, type, whether it is a rebuilt leading picture or in a hard-drop neighbourhood, worst difference) and its macroblocks at or above the threshold as `[mbx, mby, max_diff, luma_diff, visible]`, worst first, for building a viewer |
+| `--mb-threshold N` | macroblock threshold of `--mb-report` (default 8) |
 | `--work DIR` | intermediates (default `work/<input name>`). Only the files the tool creates are deleted afterwards; `run.log` stays as a trail |
 | `--keep-work` | keep the intermediates (cached proxy features are reused on the next run) |
-| `--workers N` | worker processes (default: half the logical CPUs) |
+| `--workers N` | worker threads (default: half the logical CPUs) |
 | `--no-rebuild` | never rebuild an anchor (drop rule 6 below); IDR-later pairs then use rule 7 |
 | `--keep-idr-pairs` | see drop rule 7 below |
 | `--dry-run` | detect and plan only |
 
 Exit codes:
 - 0: success.
+- 1: any other error (the report is still written).
 - 2: no duplicate cadence; no output is written.
 - 3: the input is outside the supported scope.
 - 4: `--verify` found differences outside the hard-drop neighbourhoods.
 
 Requirements:
-- Python 3.12 with numpy;
-- `ffmpeg`, `ffprobe` and `mkvmerge` on PATH.
+- `ffmpeg`, `ffprobe` and `mkvmerge` on PATH;
+- to build: Rust 1.97 or later (`cargo build --release` gives
+  `target/release/frame-dedup`). The likelihood tables are compiled in.
 
-The tests use pytest. The bitstream tests need one of the test MKVs in the
-repository root, and the CLI fail-out test needs ffmpeg built with libx264.
+Tests: `cargo test --release`. The oracle tests in `tests/` compare with
+cached outputs of the Python v1.2.0 implementation under `work/port/oracle/`
+and skip when those are missing.
 
-```
-python -m pytest -q tests
-```
+Dev tools (`frame-dedup dev <command>`):
+- `train-model sample.mkv` retrains the likelihood tables
+  (`src/cadence_model.json`).
+- `roundtrip in.h264` is the CABAC round trip.
+- `reexpress in.h264 <P dec idx> <count>` is the motion re-expression test.
+- `headers`, `records`, `motion`, `features`, `detect` and others dump
+  intermediate results as JSON.
+- `tools/e2e.ps1` runs the release build on the test files and compares
+  per-stream MD5s with reference outputs.
 
-Dev tools:
-- `python tools/train_model.py sample.mkv` retrains the shipped likelihood
-  tables.
-- `python -m frame_dedup.roundtrip_test in.h264 --types 2` is the CABAC
-  round trip.
-- `python -m frame_dedup.verify_motion in.h264 <P dec idx> <count>` is the
-  motion re-expression test.
+The tool is a Rust port of the Python implementation (v1.2.0), with
+byte-identical output: see "Rust port" below.
 
 ## How it works
 
 1. **Extract** the video track to Annex-B
    (`ffmpeg -c copy -bsf:v h264_mp4toannexb`).
    - Parse SPS (including the full VUI), PPS and slice headers
-     (`h264hdr.py`).
+     (`h264hdr.rs`).
    - The **input rate** comes from the SPS VUI:
      `time_scale / (2 * num_units_in_tick)`.
    - **Display order** comes from POC within each IDR period. Container
      timestamps are never used.
-2. **Evidence** (`evidence.py`).
+2. **Evidence** (`evidence.rs`).
    - A 480x270 gray proxy of every frame is decoded from the Annex-B stream;
      a raw decode comes out in POC order. The proxy frame count is checked
      against the picture count.
@@ -73,12 +80,12 @@ Dev tools:
    - Both are taken relative to a ±6-frame local median and turned into
      log-likelihood ratios, then summed. The ratios are trained on
      sample.mkv's 1 ms labels and shipped as
-     `frame_dedup/cadence_model.json`.
+     `src/cadence_model.json`.
    - Evidence is zeroed where the picture is static, because there it
      follows the encoder's GOP rhythm.
 3. **Chunks**: the video is split at black runs of 0.5 s or more (proxy
    mean < 20 and max < 40) and at hard cuts.
-4. **Cadence** (`cadence.py`).
+4. **Cadence** (`cadence.rs`).
    - Model: frame n shows source frame `floor(n*r + phi)`, with r = S/T.
      Frame n repeats frame n-1 iff `frac((n-1)r + phi) < 1 - r`.
    - With r = p/q in lowest terms, every arc endpoint is a multiple of 1/q,
@@ -112,7 +119,7 @@ Dev tools:
      | foliage | 10.20 |
      | smoke | 9.84 |
      | nodupes | 0.04 |
-6. **Drops** (`plan.py`). For a duplicate pair (n-1, n), the first rule
+6. **Drops** (`plan.rs`). For a duplicate pair (n-1, n), the first rule
    that applies wins:
    1. drop the later twin if it is a non-reference picture;
    2. otherwise drop the earlier twin if that is non-reference;
@@ -156,7 +163,7 @@ Dev tools:
      num_units_in_tick / time_scale = 1001/48000 (23.976), 1/48 (24) or
      1/50 (25). The fields are fixed-width u(32), so the RBSP is patched and
      then re-escaped.
-9. **Repair hard drops** (`repair.py` + `patch.py`).
+9. **Repair hard drops** (`repair.rs` + `patch.rs`).
    - The default reference lists of the deduplicated stream are recomputed
      from headers alone. Pictures whose lists change are found, plus B
      pictures whose co-located picture is one of them.
@@ -173,7 +180,7 @@ Dev tools:
      exactly: skips become explicit where needed, mvds are re-solved, the QP
      chain is kept, and direct blocks become explicit bi-prediction.
    - Work runs in parallel, one task per IDR period.
-10. **Anchor rebuilds** (`rebuild.py`), a third pass over the repaired
+10. **Anchor rebuilds** (`rebuild.rs`), a third pass over the repaired
     stream. For a pair whose earlier twin K (a P) is the forward anchor of
     the B pictures before it and whose later twin D is an IDR:
 
@@ -262,7 +269,7 @@ explicitly:
 Renumbering frame_num after a dropped reference breaks such a stream. The
 picNum differences in later headers count the dropped picture, and its own
 MMCOs never run. When the input uses either feature anywhere, the tool
-switches to explicit mode (`explicit.py`):
+switches to explicit mode (`explicit.rs`):
 
 - **Header planning.** For every kept picture, the decoder must see exactly
   its original reference lists, entry by entry, and after marking exactly
@@ -291,7 +298,7 @@ switches to explicit mode (`explicit.py`):
   into K's slot as I2, its period merges into K's with shifted POCs, and
   explicit MMCOs unmark K's period at the first reference picture after
   the leading pictures. Leading reference B pictures are fine here, unlike
-  in `rebuild.py`.
+  in `rebuild.rs`.
 - **Spatial direct.** `derive_motion` derives spatial direct (MinPositive
   reference indices, colZero). Re-expressing every inter MB of 30 pictures
   as explicit motion decodes bit-identically. B pictures whose co-located
@@ -318,43 +325,79 @@ switches to explicit mode (`explicit.py`):
 
 | module | role |
 |---|---|
-| `h264hdr.py` | Annex-B NAL iterator, SPS (incl. full VUI) / PPS / slice header parser, escape / unescape, in-place SPS timing patch |
-| `h264cabac.py` | CABAC slice-data codec (decode and encode through one code path, I_PCM included); byte-exact round trip |
-| `h264mv.py` | `dpb_walk` (POC, sliding-window ref lists) and `derive_motion` (P_Skip, temporal direct, mvd solving) |
-| `patch.py` | I_PCM macroblock patcher that keeps the rest of the picture exact (`patch_pictures` runs on a subset in a worker) |
-| `rebuild.py` | anchor rebuild: IDR demotion, period merging, list check, B1-B3 repair, recovery point SEI |
-| `explicit.py` | explicit mode: header planning (ref_pic_list_modification + MMCO 1), slice header rewriting, explicit anchor rebuilds |
-| `roundtrip_test.py`, `verify_motion.py` | CABAC round trip; motion re-expression test |
-| `evidence.py`, `cadence.py`, `plan.py` | detection and drop planning |
-| `stream.py`, `repair.py`, `decode.py`, `verify.py`, `mux.py`, `pipeline.py`, `__main__.py` | the pipeline |
-| `system.py` | priority, RAM-aware pool sizing, peak-memory probe, logging |
-| `sniff.py` | the prototype's sniffer (its taint prediction over-predicts; not used by the tool) |
+| `h264hdr.rs`, `bits.rs` | Annex-B NAL iterator, SPS (incl. full VUI) / PPS / slice header parser, escape / unescape, bit reader / writer, in-place SPS timing patch |
+| `cabac.rs`, `records.rs`, `picture.rs` | CABAC slice-data codec (decode and encode through one code path, I_PCM included); macroblock records; byte-exact round trip |
+| `mv.rs` | `dpb_walk` (POC, sliding-window ref lists) and `derive_motion` (P_Skip, temporal and spatial direct, mvd solving) |
+| `reexpress.rs` | explicit re-expression of skip / direct macroblocks; motion re-expression test |
+| `patch.rs` | I_PCM macroblock patcher that keeps the rest of the picture exact (`patch_pictures`) |
+| `rebuild.rs` | anchor rebuild: IDR demotion, period merging, list check, B1-B3 repair, recovery point SEI |
+| `explicit.rs` | explicit mode: header planning (ref_pic_list_modification + MMCO 1), slice header rewriting, explicit anchor rebuilds |
+| `evidence.rs`, `cadence.rs`, `plan.rs` | detection and drop planning |
+| `stream.rs`, `repair.rs`, `decode.rs`, `verify.rs`, `mux.rs`, `pipeline.rs`, `main.rs` | the pipeline |
+| `system.rs` | priority, RAM-aware pool sizing, peak-memory probe, logging |
+| `dev.rs` | `frame-dedup dev` commands |
 
 ### Resource use
 
 The tool is throttled by default. A full-load run with 32 workers and 64
 ffmpeg decoders once crashed a machine with marginal RAM.
 - `--workers` defaults to half the logical CPUs (16 on a 32-thread
-  machine).
+  machine). Workers are threads of one process; they share the
+  memory-mapped streams and the parsed headers.
 - Memory-heavy pools are sized so that workers × budget stays under 40% of
-  physical RAM. The budget is 0.8 GB per repair worker and 0.5 GB per
-  verify worker; measured peaks were 0.18-0.34 GB.
-- An explicit-mode repair worker has a budget of 1.5 GB (9 workers on
-  31.7 GB). It holds at most `PARSED_CAP` parsed pictures and compact
-  co-located motion fields. It decodes the original again each round
-  instead of keeping it, and it keeps only the PCM samples of the MBs it
-  patches. The peak was 1.0 GB on an 864-picture merged period.
-- Each worker runs at most one full-resolution ffmpeg decoder, with 2
+  physical RAM, with the budgets measured for the Python implementation:
+  0.8 GB per repair worker, 1.5 GB per explicit-mode repair worker (9
+  workers on 31.7 GB) and 0.5 GB per verify worker. The threads need much
+  less; the process peak on the full Amazon file was 6.7 GB, including the
+  pages of the two 6 GB streams it maps.
+- An explicit-mode repair task holds at most `PARSED_CAP` parsed pictures
+  and the co-located motion fields of reference pictures. It decodes the
+  original again each round instead of keeping it, and it keeps only the
+  PCM samples of the MBs it patches.
+- Each worker runs at most one full-resolution ffmpeg decoder at a time
+  (explicit repair: the new and original decodes in lockstep), with 2
   threads. Verify hashes the original, then compares the output, then
   re-decodes only for frames that differ. It uses half the workers,
   because each keeps a decoder busy.
 - The proxy decode is a single ffmpeg with up to 8 threads.
-- The main process, the pool workers and every ffmpeg / mkvmerge child run
-  at below-normal priority (`SetPriorityClass`,
-  `BELOW_NORMAL_PRIORITY_CLASS`).
-- Repair workers are recycled every 2 tasks.
+- The process and every ffmpeg / ffprobe / mkvmerge child run at
+  below-normal priority (`SetPriorityClass`, `BELOW_NORMAL_PRIORITY_CLASS`).
 - Logging is unbuffered and also goes to `<work>/run.log`.
 
+## Rust port
+
+Version 2.0 is a port of the Python implementation (v1.2.0) to Rust, so
+that Python is no longer needed. Every module was checked against the
+Python one on real data, then the whole tool end to end:
+- Output MKVs are identical per stream (video, audio, subtitles; MD5) to
+  v1.2.0's on sample, foliage, smoke, the 5-minute Amazon clip and the full
+  Amazon file, and nodupes fails out identically. The reports are equal
+  except for timings, worker counts, memory figures and the tool version.
+- Intermediate checks included: every header of the full Amazon stream;
+  macroblock records and motion fields of every picture of four clips; the
+  stage-1 stream of the full Amazon run byte for byte; 119 recorded
+  `patch_pictures` calls; the repaired and rebuilt streams of all four test
+  files byte for byte, with 1 and 4 workers.
+- The proxy features match numpy bit for bit, including its float32
+  pairwise summation order, so detection cannot drift.
+
+Wall-clock times with `--verify`, fresh work directories (proxy decode
+included unless noted):
+
+| file | Python v1.2.0 | Rust 2.0 |
+|---|---|---|
+| sample (8 / 4 workers) | 189 s | 113 s |
+| 5-minute Amazon clip (8 / 4 workers) | 240 s | 93 s |
+| foliage (8 workers) | 737 s | 208 s |
+| smoke (8 workers) | 829 s | 339 s |
+| full Amazon file (16 workers) | 94 min (proxy features cached) | 31 min |
+| full Amazon: repair stage | 79 min | 20 min |
+| full Amazon: verify stage | 14 min | 8 min |
+
+The CABAC codec runs about 40× faster than the Python and motion
+derivation about 70× faster. What remains is mostly ffmpeg: the measured
+repair and the anchor rebuild decode every affected IDR period several
+times, and verify decodes everything twice.
 ## Results
 
 Measured on the four test files on a 32-thread / 31.7 GB machine with
@@ -435,7 +478,7 @@ what makes I2 a keyframe). At five rebuilt pairs spread over the file
 continuous decode from the previous real IDR, and a seek 60 ms earlier, into
 the leading B pictures, lands on the previous keyframe and is exact too. A
 raw decode starting at I2's byte offset also reproduces every frame from I2
-on (`tests/test_rebuild.py`).
+on (the Python v1.2.0 test suite).
 
 Raw-stream check: the output's SPS signals 1001/48000, and ffprobe reports
 `tbr 47.95` for it, just as it reports 59.94 for the 29.97 input. mkvmerge,
@@ -536,5 +579,5 @@ given only the raw output stream with no `--default-duration`, infers
 - Native-rate intros (logos) are forced through the content cadence, which
   can drop real frames there. This is by design: the output is always CFR.
 - The likelihood tables were trained on one file from this encoder. Other
-  encoders may need retraining with `tools/train_model.py` on a labelled
+  encoders may need retraining with `frame-dedup dev train-model` on a labelled
   file.

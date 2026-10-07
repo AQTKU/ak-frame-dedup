@@ -25,10 +25,9 @@ pub const PH: usize = 270;
 pub const BW: usize = 16;
 pub const BH: usize = 15;
 
-/// The cadence model, embedded so the binary is self-contained. (Lives in the
-/// Python package directory for now; move it next to the sources when
-/// `frame_dedup/` is deleted.)
-const MODEL_JSON: &str = include_str!("../frame_dedup/cadence_model.json");
+/// The cadence model, embedded so the binary is self-contained (retrain with
+/// `frame-dedup dev train-model`).
+const MODEL_JSON: &str = include_str!("cadence_model.json");
 
 /// numpy-compatible numerics.
 pub mod np {
