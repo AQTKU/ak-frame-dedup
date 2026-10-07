@@ -11,6 +11,10 @@ pub fn main(args: &[String]) -> Result<()> {
     };
     let _ = rest;
     match cmd.as_str() {
+        "framemd5" => crate::decode::dev_framemd5(rest),
+        "mux-cmd" | "mux" | "duration-check" => crate::mux::dev_main(cmd, rest),
+        "maxdiff" => crate::verify::dev_maxdiff(rest),
+        "sysinfo" => crate::system::dev_sysinfo(),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }
