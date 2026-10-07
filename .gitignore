@@ -1,0 +1,11 @@
+# media and intermediates
+*.mkv
+*.h264
+*.yuv
+*.npy
+*.pkl
+work/
+review/**/*.png
+review/**/cases.json
+__pycache__/
+*.pyc
