@@ -17,6 +17,13 @@ pub fn main(args: &[String]) -> Result<()> {
         "headers" => crate::stream::dev_headers(rest),
         "escape" => crate::stream::dev_escape(rest),
         "patch-sps" => crate::stream::dev_patch_sps(rest),
+        "plan-stream" => crate::explicit::dev_plan_stream(rest),
+        "write-explicit" => crate::explicit::dev_write_explicit(rest),
+        "explicit-candidates" => crate::explicit::dev_explicit_candidates(rest),
+        "write-stream" => crate::stream::dev_write_stream(rest),
+        "new-lists" => crate::stream::dev_new_lists(rest),
+        "rebuild-candidates" => crate::rebuild::dev_rebuild_candidates(rest),
+        "write-rebuilt" => crate::rebuild::dev_write_rebuilt(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }
