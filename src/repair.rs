@@ -427,6 +427,8 @@ struct TaskResult {
     rounds: Option<usize>,
     patches: BTreeMap<usize, usize>,
     seconds: f64,
+    /// Measured repair with corrections: I_PCM fallbacks by reason.
+    pcm_why: [usize; 4],
 }
 
 /// A 128-bit hash of a frame (the seen-frame cache of the measured repair
@@ -572,7 +574,7 @@ fn corr_max_err(d: &Drift) -> u8 {
     (d.threshold / 2).max(3)
 }
 /// A macroblock still drifting after this many corrections gets I_PCM.
-const CORR_MAX_TRIES: u8 = 2;
+const CORR_MAX_TRIES: u8 = 3;
 
 /// Reference frames kept during one measure pass for the corrections: a
 /// frame is kept from when it is decoded until every picture of the period
@@ -582,6 +584,9 @@ const CORR_MAX_TRIES: u8 = 2;
 #[derive(Default)]
 struct RefFrames {
     frames: [HashMap<usize, Vec<u8>>; 2],
+    /// New pictures: the original samples of the MBs fixed this round (the
+    /// picture as later pictures will see it, up to deblocking).
+    fixed: HashMap<usize, Vec<((u16, u16), Box<[u8; 384]>)>>,
     /// Pictures still to be handled that list each picture (index 0: new
     /// decode indices in new lists; 1: original decode indices in original lists).
     readers: [HashMap<usize, usize>; 2],
@@ -622,9 +627,29 @@ impl RefFrames {
                     *n -= 1;
                     if *n == 0 {
                         self.frames[s].remove(&x);
+                        if s == 0 {
+                            self.fixed.remove(&x);
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+/// Write I_PCM-layout samples into macroblock (x, y) of a yuv420p frame
+/// (coded size, `mb_w` macroblocks wide).
+fn put_mb(dst: &mut [u8], s: &[u8; 384], mb_w: usize, x: usize, y: usize) {
+    let w = mb_w * 16;
+    let h = dst.len() * 2 / 3 / w;
+    for r in 0..16 {
+        let o = (y * 16 + r) * w + x * 16;
+        dst[o..o + 16].copy_from_slice(&s[r * 16..r * 16 + 16]);
+    }
+    for (c, base) in [w * h, w * h * 5 / 4].into_iter().enumerate() {
+        for r in 0..8 {
+            let o = base + (y * 8 + r) * (w / 2) + x * 8;
+            dst[o..o + 8].copy_from_slice(&s[256 + c * 64 + r * 8..256 + c * 64 + r * 8 + 8]);
         }
     }
 }
@@ -654,10 +679,17 @@ fn remap_refs(m: &Motion, lists: &[Vec<usize>; 2]) -> Result<Motion> {
 /// stream: the original's pre-deblocking reconstruction is the target, the
 /// prediction is the one the new stream makes from its decoded references.
 /// The current record of an MB is its last correction, if any.
+///
+/// The target is the original's pre-deblocking reconstruction plus the
+/// difference in what deblocking does to the MB in the original and in the
+/// current decode (`now`: the current decoded samples of each MB, `orig`:
+/// the original's), so a correction also makes up for deblocking that
+/// differs. The prediction reads the references as they will be after this
+/// round's fixes.
 fn corrections(
     cx: &Ctx,
     nd: usize,
-    mbs: &[(u16, u16)],
+    mbs: &[((u16, u16), Box<[u8; 384]>, Box<[u8; 384]>)],
     refs: &RefFrames,
     fixes: &HashMap<(usize, u16, u16), Fix>,
 ) -> Result<HashMap<(u16, u16), Correction>> {
@@ -668,9 +700,24 @@ fn corrections(
     let mn = remap_refs(&mo, &cx.new_pics[nd].lists)?;
     let qps = qp_chain(&dd.mbs, dd.sl.qp);
     let orig_ref = |r: usize| refs.frames[1].get(&r).map(|f| Frame::new(f, sps));
-    let new_ref = |r: usize| refs.frames[0].get(&r).map(|f| Frame::new(f, sps));
+    let cur_ref = |r: usize| refs.frames[0].get(&r).map(|f| Frame::new(f, sps));
+    // references with this round's fixes pasted in
+    let mut predicted: HashMap<usize, Vec<u8>> = HashMap::new();
+    for r in cx.new_pics[nd].lists.iter().flatten().copied() {
+        if let (Some(fx), Some(f)) = (refs.fixed.get(&r), refs.frames[0].get(&r)) {
+            if !predicted.contains_key(&r) {
+                let mut f = f.clone();
+                for ((x, y), s) in fx {
+                    put_mb(&mut f, s, sps.mb_w, *x as usize, *y as usize);
+                }
+                predicted.insert(r, f);
+            }
+        }
+    }
+    let new_ref = |r: usize| predicted.get(&r).or_else(|| refs.frames[0].get(&r)).map(|f| Frame::new(f, sps));
     let mut out = HashMap::new();
-    for &(x, y) in mbs {
+    for ((x, y), now_s, orig_post) in mbs {
+        let (x, y) = (*x, *y);
         let i = y as usize * sps.mb_w + x as usize;
         let orig = &dd.mbs[i];
         if orig.intra {
@@ -682,15 +729,26 @@ fn corrections(
             None => (orig, qps[i]),
         };
         let opred = predict_mb(pps, &cx.pics[d], cx.pics, &mo, x as usize, y as usize, &orig_ref)?;
-        let target = add_residual(&opred, &residual(orig, qps[i], pps)?);
+        let pre_orig = add_residual(&opred, &residual(orig, qps[i], pps)?);
+        let cpred = predict_mb(pps, &cx.new_pics[nd], cx.new_pics, &mn, x as usize, y as usize, &cur_ref)?;
+        let pre_now = add_residual(&cpred, &residual(base, bqp, pps)?);
+        // deblocking moved the original by orig_post - pre_orig and moves the
+        // current decode by now - pre_now: aim off by the difference
+        let target: [u8; 384] = std::array::from_fn(|k| {
+            let deb = (orig_post[k] as i32 - pre_orig[k] as i32) - (now_s[k] as i32 - pre_now[k] as i32);
+            (pre_orig[k] as i32 + deb).clamp(0, 255) as u8
+        });
         let npred = predict_mb(pps, &cx.new_pics[nd], cx.new_pics, &mn, x as usize, y as usize, &new_ref)?;
         let c = correct(base, bqp, pps, &npred, &target, corr_max_err(&cx.drift)).with_context(|| format!("picture {nd} MB ({x}, {y})"))?;
         if std::env::var_os("FD_CORR_DEBUG").is_some() {
             let pre = npred.iter().zip(&target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
             let cur = add_residual(&npred, &residual(base, bqp, pps)?);
             let now = cur.iter().zip(&target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
-            eprintln!("CORR nd {nd} ({x},{y}) {} skip {} qp {bqp} pred-target {pre} current {now} -> err {} at qp {} cbp {:#x}->{:#x}",
-                      cx.new_pics[nd].typ().as_str(), base.skip, c.err, c.qp, base.cbp, c.mb.cbp);
+            let post = (0..384).map(|k| orig_post[k].abs_diff(now_s[k])).max().unwrap_or(0);
+            let aim = (0..384).map(|k| target[k].abs_diff(pre_now[k])).max().unwrap_or(0);
+            let same = matches!(fixes.get(&(nd, x, y)), Some(Fix::Corr(m, .., q)) if **m == c.mb && *q == c.qp);
+            eprintln!("CORR nd {nd} ({x},{y}) {} skip {} qp {bqp} pred-target {pre} current {now} post {post} aim {aim} -> err {} at qp {} same {same} tried {}",
+                      cx.new_pics[nd].typ().as_str(), base.skip, c.err, c.qp, matches!(fixes.get(&(nd, x, y)), Some(Fix::Corr(..))));
         }
         out.insert((x, y), c);
     }
@@ -743,6 +801,9 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     let mut seen: HashMap<usize, ((u64, u64), Vec<u8>)> = HashMap::new();
     let mut capped: BTreeSet<usize> = BTreeSet::new();
     let mut worst: HashMap<usize, u8> = HashMap::new();
+    // why MBs got I_PCM with corrections on: no correction (intra), error
+    // too large, corrected too often, correction unchanged
+    let mut pcm_why = [0usize; 4];
     let mut rounds = 0usize;
     let mut viol: BTreeMap<usize, Vec<(u8, u16, u16)>>;
     let mut res: PatchResult;
@@ -758,7 +819,14 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         let mut keep: HashMap<usize, HashMap<(u16, u16), Samples>> = HashMap::new();
         let mut corr: HashMap<usize, HashMap<(u16, u16), Correction>> = HashMap::new();
         let mut refs = if use_corr { RefFrames::new(cx, &order) } else { RefFrames::default() };
-        let mut pending: Vec<(usize, Vec<(u16, u16)>)> = Vec::new();
+        type Pending = (usize, Vec<((u16, u16), Samples, Samples)>);
+        let mut pending: Vec<Pending> = Vec::new();
+        // early rounds patch only up to the first drifting reference picture
+        // in decode order: corrections of later pictures would go unused
+        // (with corrections every round fixes every picture: corrections are
+        // made against references predicted after this round's fixes)
+        let sequential = rounds < DRIFT_SEQUENTIAL_ROUNDS && !use_corr;
+        let mut first_ref = usize::MAX;
         let mut ogen = OrigFrames { cx, periods: &task.orig_periods, next_period: 0, cur: None, fs };
         let mut n_out = 0usize;
         {
@@ -823,10 +891,20 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                         .map(|&(_, x, y)| ((x, y), pcm_record(&ofr, w, x as usize, y as usize).samples.expect("PCM record has samples")))
                         .collect();
                     if use_corr {
-                        pending.push((nd, samples.keys().copied().collect()));
+                        let now = |x: u16, y: u16| pcm_record(&fr, w, x as usize, y as usize).samples.expect("PCM record has samples");
+                        pending.push((nd, samples.iter().map(|(&(x, y), s)| ((x, y), now(x, y), s.clone())).collect()));
+                        // pictures that read this one are corrected against
+                        // what it will be: the MBs fixed this round as the
+                        // original (exact up to deblocking at their edges)
+                        if refs.frames[0].contains_key(&nd) {
+                            refs.fixed.insert(nd, samples.iter().map(|(&k, s)| (k, s.clone())).collect());
+                        }
                     }
                     keep.insert(nd, samples);
                     viol.insert(nd, bad);
+                    if new_pics[nd].ref_idc != 0 && !capped.contains(&nd) {
+                        first_ref = first_ref.min(nd);
+                    }
                 }
                 // corrections of pictures whose references have all arrived
                 if use_corr {
@@ -835,7 +913,9 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                         let nd = pending[i].0;
                         if refs.ready(cx, nd) {
                             let (nd, mbs) = pending.swap_remove(i);
-                            corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+                            if !sequential || nd <= first_ref {
+                                corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+                            }
                             refs.release(cx, nd);
                         } else {
                             i += 1;
@@ -859,7 +939,9 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
             if !refs.ready(cx, nd) {
                 bail!("period {}: reference frames of picture {nd} never arrived", task.period);
             }
-            corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+            if !sequential || nd <= first_ref {
+                corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+            }
         }
         drop(refs);
         rounds += 1;
@@ -903,12 +985,23 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                             version += 1;
                             Fix::Corr(Box::new(c.mb.clone()), version, tries + 1, c.qp)
                         }
-                        None => Fix::Pcm(kept.remove(&(x, y)).expect("kept sample")),
+                        None => {
+                            if use_corr {
+                                let why = match cs.and_then(|c| c.get(&(x, y))) {
+                                    None => 0,
+                                    Some(c) if c.err > corr_max_err(&cx.drift) => 1,
+                                    Some(_) if tries >= CORR_MAX_TRIES => 2,
+                                    Some(_) => 3,
+                                };
+                                pcm_why[why] += 1;
+                            }
+                            Fix::Pcm(kept.remove(&(x, y)).expect("kept sample"))
+                        }
                     };
                     fixes.insert((nd, x, y), fix);
                 }
             }
-            if new_pics[nd].ref_idc != 0 && rounds <= DRIFT_SEQUENTIAL_ROUNDS {
+            if new_pics[nd].ref_idc != 0 && rounds <= DRIFT_SEQUENTIAL_ROUNDS && !use_corr {
                 break;
             }
         }
@@ -937,6 +1030,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         rounds: Some(rounds),
         patches: patches.iter().map(|(nd, v)| (*nd, v.len())).collect(),
         seconds: round1(t0.elapsed().as_secs_f64()),
+        pcm_why,
     })
 }
 
@@ -1062,6 +1156,7 @@ fn run_task_exact(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         rounds: None,
         patches: patches.iter().map(|(nd, v)| (*nd, v.len())).collect(),
         seconds: round1(t0.elapsed().as_secs_f64()),
+        pcm_why: [0; 4],
     })
 }
 
@@ -1176,6 +1271,13 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         o.insert("drift_threshold".into(), json!(a.drift.threshold));
         if a.drift.corrections {
             o.insert("corrected_mbs".into(), json!(corrected_mbs));
+            let w = results.iter().fold([0usize; 4], |mut acc, r| {
+                for (a, b) in acc.iter_mut().zip(r.pcm_why) {
+                    *a += b;
+                }
+                acc
+            });
+            o.insert("pcm_reasons".into(), json!({"intra_or_uncomputed": w[0], "error": w[1], "tries": w[2], "unchanged": w[3]}));
         }
         o.insert("drift_max_per_picture".into(), json!(((a.drift.max_fraction * sps.mb_w as f64 * sps.mb_h as f64) as usize).max(1)));
         o.insert("seconds".into(), json!(round1(results.iter().map(|r| r.seconds).sum::<f64>())));

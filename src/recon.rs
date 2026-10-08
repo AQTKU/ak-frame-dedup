@@ -657,7 +657,7 @@ pub struct Correction {
 /// original luma levels times 2^k, which reproduces their residual exactly
 /// (see the `qp_minus_6_doubles_exactly` test), and halves the quantiser step
 /// of the correction k times.
-pub const QP_DROPS: [i32; 3] = [0, 6, 12];
+pub const QP_DROPS: [i32; 4] = [0, 6, 12, 18];
 
 /// Change the levels of inter macroblock `mb` (luma QP `qp`) so that its
 /// reconstruction over prediction `pred` comes as close as the quantiser
@@ -701,7 +701,10 @@ pub fn correct(mb: &Mb, qp: i32, pps: &Pps, pred: &[u8; 384], target: &[u8; 384]
         if q < 0 {
             break;
         }
-        let c = solve(requantise(&n, qp, q, pps), q, pps, pred, target)?;
+        let mut c = solve(requantise(&n, qp, q, pps), q, pps, pred, target)?;
+        if c.err > max_err {
+            c = refine(c, pps, pred, target)?;
+        }
         let done = c.err <= max_err;
         if best.as_ref().is_none_or(|b| c.err < b.err) {
             best = Some(c);
@@ -711,6 +714,140 @@ pub fn correct(mb: &Mb, qp: i32, pps: &Pps, pred: &[u8; 384], target: &[u8; 384]
         }
     }
     Ok(best.expect("QP 0 at least"))
+}
+
+/// Residual of one luma block from its levels (scan order): 4x4 or 8x8.
+fn luma_block(levels: Option<&Vec<i32>>, t8: bool, qp: i32) -> Vec<i32> {
+    if t8 {
+        let mut d = [0i32; 64];
+        for (s, &c) in levels.into_iter().flatten().enumerate() {
+            d[ZIGZAG8[s]] = dequant8(c, qp, ZIGZAG8[s]);
+        }
+        idct8(&d).to_vec()
+    } else {
+        let mut d = [0i32; 16];
+        for (s, &c) in levels.into_iter().flatten().enumerate() {
+            d[ZIGZAG4[s]] = dequant4(c, qp, ZIGZAG4[s]);
+        }
+        idct4(&d).to_vec()
+    }
+}
+
+/// (max |error|, samples at the max, sum of squares): smaller is better.
+fn score(err: impl Iterator<Item = i32>) -> (i32, usize, i64) {
+    let (mut m, mut n, mut ss) = (0, 0, 0i64);
+    for e in err {
+        let a = e.abs();
+        if a > m {
+            (m, n) = (a, 1);
+        } else if a == m {
+            n += 1;
+        }
+        ss += (e * e) as i64;
+    }
+    (m, n, ss)
+}
+
+/// Greedy max-error refinement of a least-squares correction: change one
+/// level by +-1 in the block holding the worst sample, as long as that makes
+/// the worst error (then the number of samples at it, then the squared
+/// error) smaller.
+fn refine(c: Correction, pps: &Pps, pred: &[u8; 384], target: &[u8; 384]) -> Result<Correction> {
+    const ITERS: usize = 16;
+    let qp = c.qp;
+    let mut n = c.mb;
+    if n.coef.is_none() {
+        n.coef = Some(Box::default());
+    }
+    for _ in 0..ITERS {
+        let res = residual(&n, qp, pps)?;
+        let e: Vec<i32> = (0..384).map(|i| target[i] as i32 - clip1(pred[i] as i32 + res[i])).collect();
+        let cur = score(e.iter().copied());
+        if cur.0 <= 1 {
+            break;
+        }
+        let s = (0..384).max_by_key(|&i| (e[i].abs(), std::cmp::Reverse(i))).expect("384 samples");
+        let mut best: Option<((i32, usize, i64), Mb)> = None;
+        if s < 256 {
+            let (x, y) = (s % 16, s / 16);
+            let t8 = n.t8;
+            // the block's samples (MB offsets) and its level slot
+            let (cells, slot): (Vec<usize>, usize) = if t8 {
+                let i8 = (y / 8) * 2 + x / 8;
+                ((0..64).map(|k| ((i8 / 2) * 8 + k / 8) * 16 + (i8 % 2) * 8 + k % 8).collect(), i8)
+            } else {
+                let blk = BLK_XY.iter().position(|&b| b == (x / 4, y / 4)).expect("luma block");
+                let (bx, by) = BLK_XY[blk];
+                ((0..16).map(|k| (by * 4 + k / 4) * 16 + bx * 4 + k % 4).collect(), blk)
+            };
+            let outside = {
+                let mut v = e.clone();
+                for &i in &cells {
+                    v[i] = 0;
+                }
+                v
+            };
+            let coef = n.coef.as_ref().expect("set above");
+            let levels = if t8 { coef.l8[slot].clone() } else { coef.l4[slot].clone() };
+            let len = if t8 { 64 } else { 16 };
+            for p in 0..len {
+                for dir in [1, -1] {
+                    let mut l = levels.clone().unwrap_or_else(|| vec![0; len]);
+                    l.resize(len, 0);
+                    l[p] += dir;
+                    let r = luma_block(Some(&l), t8, qp);
+                    let mut v = outside.clone();
+                    for (k, &i) in cells.iter().enumerate() {
+                        v[i] = target[i] as i32 - clip1(pred[i] as i32 + r[k]);
+                    }
+                    let sc = score(v.into_iter());
+                    if sc < cur && best.as_ref().is_none_or(|b| sc < b.0) {
+                        let mut m = n.clone();
+                        let cf = m.coef.as_mut().expect("set above");
+                        if t8 {
+                            cf.l8[slot] = Some(l);
+                        } else {
+                            cf.l4[slot] = Some(l);
+                        }
+                        best = Some((sc, m));
+                    }
+                }
+            }
+        } else {
+            // chroma: the block's AC levels and the component's DC levels
+            let comp = (s - 256) / 64;
+            let k = (s - 256) % 64;
+            let blk = (k / 8 / 4) * 2 + (k % 8) / 4;
+            for slot in 0..19 {
+                for dir in [1, -1] {
+                    let mut m = n.clone();
+                    let cf = m.coef.as_mut().expect("set above");
+                    if slot < 4 {
+                        let v = cf.cdc[comp].get_or_insert_with(|| vec![0; 4]);
+                        v.resize(4, 0);
+                        v[slot] += dir;
+                    } else {
+                        let v = cf.cac[comp][blk].get_or_insert_with(|| vec![0; 15]);
+                        v.resize(15, 0);
+                        v[slot - 4] += dir;
+                    }
+                    let r = residual(&m, qp, pps)?;
+                    let sc = score((0..384).map(|i| target[i] as i32 - clip1(pred[i] as i32 + r[i])));
+                    if sc < cur && best.as_ref().is_none_or(|b| sc < b.0) {
+                        best = Some((sc, m));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((_, m)) => n = m,
+            None => break,
+        }
+    }
+    normalise(&mut n);
+    let recon = add_residual(pred, &residual(&n, qp, pps)?);
+    let err = recon.iter().zip(target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+    Ok(Correction { mb: n, recon, err, qp })
 }
 
 /// The record `mb` (levels at luma QP `from`) re-expressed at QP `to` <=
@@ -978,6 +1115,56 @@ mod tests {
         let mut d = [0; 64];
         d[0] = 64 * 3;
         assert!(idct8(&d).iter().all(|&v| v == 3));
+    }
+
+    fn test_pps() -> Pps {
+        Pps {
+            id: 0,
+            sps_id: 0,
+            cabac: true,
+            bottom_field_poc_present: false,
+            num_slice_groups: 1,
+            num_ref_idx_l0_default: 1,
+            num_ref_idx_l1_default: 1,
+            weighted_pred: false,
+            weighted_bipred_idc: 0,
+            pic_init_qp: 26,
+            chroma_qp_offset: -3,
+            deblocking_ctrl_present: true,
+            constrained_intra: false,
+            redundant_pic_cnt_present: false,
+            transform_8x8: true,
+            scaling_matrix: false,
+            chroma_qp_offset2: -3,
+        }
+    }
+
+    /// A correction of drift by noise: within the acceptance error at some
+    /// QP of the ladder, the original QP for a flat offset.
+    #[test]
+    fn correct_reaches_target() {
+        let pps = test_pps();
+        let mut mb = Mb::new(0, 0);
+        mb.kind = crate::records::Kind::P;
+        mb.skip = true;
+        let mut s = 12345u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            (s >> 16) as i32
+        };
+        let pred: [u8; 384] = std::array::from_fn(|i| (100 + (i as i32 % 16) * 3 + rnd() % 5) as u8);
+        // flat offset: the original QP is enough
+        let target: [u8; 384] = std::array::from_fn(|i| pred[i] + 6);
+        let c = correct(&mb, 30, &pps, &pred, &target, 3).unwrap();
+        assert!(c.err <= 3, "flat: err {}", c.err);
+        assert_eq!(c.qp, 30);
+        assert!(!c.mb.skip && c.mb.cbp != 0);
+        // noise: needs a lower QP
+        let target: [u8; 384] = std::array::from_fn(|i| (pred[i] as i32 + rnd() % 7 - 3).clamp(0, 255) as u8);
+        let c = correct(&mb, 30, &pps, &pred, &target, 3).unwrap();
+        assert!(c.err <= 3, "noise: err {} at qp {}", c.err, c.qp);
+        // the reconstruction it reports is the real one
+        assert_eq!(c.recon, add_residual(&pred, &residual(&c.mb, c.qp, &pps).unwrap()));
     }
 
     /// Lowering QP by 6 and doubling the levels reproduces the dequantised
