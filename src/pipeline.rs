@@ -82,23 +82,27 @@ pub struct Args {
     /// detect and plan only; write no video
     #[arg(long)]
     pub dry_run: bool,
-    /// explicit mode: patch macroblocks off by this much or more (default 16)
-    #[arg(long, default_value_t = crate::repair::DRIFT_THRESHOLD, value_parser = clap::value_parser!(u8).range(1..), hide = true)]
-    pub drift_threshold: u8,
-    /// explicit mode: patch at most this fraction of a picture (default 0.02)
-    #[arg(long, default_value_t = crate::repair::DRIFT_MAX_FRACTION, hide = true)]
-    pub drift_cap: f64,
-    /// explicit mode: repair inter MBs with residual corrections before I_PCM
-    #[arg(long, hide = true)]
-    pub drift_corrections: bool,
-    /// explicit mode with corrections: I_PCM only for MBs off by this much
-    /// (default: the drift threshold)
-    #[arg(long, hide = true)]
-    pub drift_pcm_threshold: Option<u8>,
-    /// explicit mode with corrections: per-period byte budget as a fraction
-    /// of the bytes dropped from the period (0: none)
-    #[arg(long, default_value_t = 0.0, hide = true)]
+    /// repair drift with I_PCM only, as version 2.0 did (no residual
+    /// corrections)
+    #[arg(long)]
+    pub no_corrections: bool,
+    /// measured repair: correct macroblocks off by this much or more
+    /// (default 6; 16 with --no-corrections)
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..))]
+    pub drift_threshold: Option<u8>,
+    /// measured repair: I_PCM for macroblocks off by this much or more that
+    /// no correction fixes (default 8); below it they are left as they are
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..))]
+    pub pcm_threshold: Option<u8>,
+    /// measured repair: an IDR period that has added more than this times the
+    /// bytes dropped from it only repairs from --pcm-threshold on (default 1;
+    /// 0: no budget)
+    #[arg(long, default_value_t = crate::repair::DRIFT_BUDGET)]
     pub drift_budget: f64,
+    /// measured repair: patch at most this fraction of a picture (default 1
+    /// with corrections, 0.02 without)
+    #[arg(long, hide = true)]
+    pub drift_cap: Option<f64>,
 
     /// use explicit reference control (and the measured repair) even when
     /// the stream does not need it
@@ -741,7 +745,7 @@ impl Run {
             let rb_es = self.work.join("rebuilt.h264");
             let (o, rb) = rebuild::rebuild(
                 &ld.es, &out_es, &rb_es, &nspss, &nppss, &ld.pics, &src_pics, &src_orig, &rbs, self.workers, &self.work, &self.log,
-                if self.a.drift_corrections { Some(self.a.drift_threshold) } else { None },
+                if self.a.no_corrections { None } else { Some(rebuild::CORR_THRESHOLD) },
             )?;
             orig_of_out = o;
             self.log(&format!(
@@ -755,6 +759,20 @@ impl Run {
             self.stage("rebuild", t);
         }
         Ok(Written { out_es, orig_of_out })
+    }
+
+    /// The measured repair's settings from the command line.
+    fn drift(&self) -> crate::repair::Drift {
+        use crate::repair::*;
+        let corrections = !self.a.no_corrections;
+        let threshold = self.a.drift_threshold.unwrap_or(if corrections { DRIFT_THRESHOLD_CORR } else { DRIFT_THRESHOLD });
+        crate::repair::Drift {
+            threshold,
+            max_fraction: self.a.drift_cap.unwrap_or(if corrections { 1.0 } else { DRIFT_MAX_FRACTION }),
+            corrections,
+            pcm_threshold: self.a.pcm_threshold.unwrap_or(if corrections { PCM_THRESHOLD_CORR } else { threshold }),
+            budget: if corrections { self.a.drift_budget } else { 0.0 },
+        }
     }
 
     /// Streams with MMCO / list modification: one header plan for every drop
@@ -826,13 +844,7 @@ impl Run {
                     sigma: Some(&sigma),
                     work: &self.work,
                     orig_of_out: Some(&orig_of_out),
-                    drift: crate::repair::Drift {
-                        threshold: self.a.drift_threshold,
-                        max_fraction: self.a.drift_cap,
-                        corrections: self.a.drift_corrections,
-                        pcm_threshold: self.a.drift_pcm_threshold.unwrap_or(self.a.drift_threshold),
-                        budget: self.a.drift_budget,
-                    },
+                    drift: self.drift(),
                 },
                 &self.log,
             )?;

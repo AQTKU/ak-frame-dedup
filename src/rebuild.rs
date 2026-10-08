@@ -56,6 +56,9 @@ pub const MAX_ROUNDS: usize = 4;
 /// Rounds with residual corrections (B1-B3 are not references: corrections
 /// do not interact, they only need a few rounds for deblocking).
 pub const MAX_ROUNDS_CORR: usize = 8;
+/// With corrections (the default), B1-B3 macroblocks off by this much or more
+/// get residual corrections.
+pub const CORR_THRESHOLD: u8 = 8;
 /// With corrections, a correction is retried this often before an MB over
 /// [`PCM_THRESHOLD`] gets I_PCM.
 const CORR_MAX_TRIES: u8 = 3;

@@ -60,6 +60,13 @@ use crate::verify::{mb_maxdiff, visible_maxdiff};
 pub const DRIFT_THRESHOLD: u8 = 16;
 pub const DRIFT_MAX_FRACTION: f64 = 0.02;
 pub const DRIFT_MAX_ROUNDS: usize = 12;
+/// With residual corrections (the default): MBs off by this much are
+/// corrected, ...
+pub const DRIFT_THRESHOLD_CORR: u8 = 6;
+/// ... and those no correction fixes get I_PCM from this much on.
+pub const PCM_THRESHOLD_CORR: u8 = 8;
+/// Per-period byte budget, as a fraction of the bytes dropped from it.
+pub const DRIFT_BUDGET: f64 = 1.0;
 /// With corrections a round is cheap, and a long period with heavy drift
 /// needs more of them to settle.
 pub const DRIFT_MAX_ROUNDS_CORR: usize = 20;

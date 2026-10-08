@@ -351,9 +351,13 @@ pub struct PatchStats {
 impl PatchStats {
     /// The Python dict: `type, pcm, direct_explicit, skip_explicit, qp_carrier, bytes_before, bytes_after`.
     pub fn to_json(&self) -> Value {
-        json!({"type": self.typ.as_str(), "pcm": self.pcm, "corrected": self.corrected, "direct_explicit": self.direct_explicit,
+        let mut v = json!({"type": self.typ.as_str(), "pcm": self.pcm, "direct_explicit": self.direct_explicit,
                "skip_explicit": self.skip_explicit, "qp_carrier": self.qp_carrier,
-               "bytes_before": self.bytes_before, "bytes_after": self.bytes_after})
+               "bytes_before": self.bytes_before, "bytes_after": self.bytes_after});
+        if self.corrected > 0 {
+            v["corrected"] = json!(self.corrected);
+        }
+        v
     }
 }
 
@@ -597,9 +601,10 @@ pub fn patch_pictures(
         }
         let nal: Nal = Arc::new(try_encode_picture(dd, ctx.spss, ctx.ppss, &mut new).with_context(|| format!("dec {d} {}", t.as_str()))?);
         log(&format!(
-            "dec {d} {}: PCM {} MB, corrected {n_corr} MB, direct->explicit {n_direct}, skip->explicit {n_skip}, qp-carrier {forced}; {}B -> {}B",
+            "dec {d} {}: PCM {} MB, {}direct->explicit {n_direct}, skip->explicit {n_skip}, qp-carrier {forced}; {}B -> {}B",
             t.as_str(),
             targets.len() - n_corr,
+            if n_corr > 0 { format!("corrected {n_corr} MB, ") } else { String::new() },
             dd.nal_len,
             nal.len()
         ));
