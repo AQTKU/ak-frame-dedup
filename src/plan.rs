@@ -16,15 +16,16 @@
 //!     `rebuildable` allows it; otherwise the cheap picture within 3 frames
 //!     with the least motion is dropped instead (a visible substitute: one
 //!     real frame is lost, but A/V sync holds); only if there is none is the
-//!     pair kept ("unsupported") and the count corrected in the next black run.
+//!     pair kept ("unsupported") and the count corrected at the next sync point.
 //!
 //! A/V sync: kept frame n becomes output frame k, shown at k / fps_out where
 //! it was shown at n / fps_in. Its offset in output frames is k - n * r.
 //! Inside a stretch of constant phase the offsets cycle around a constant
-//! mean. After a phase change or a kept pair that mean moves; at each black
-//! run the number of black frames kept is adjusted (one extra dropped, or one
-//! duplicate kept) so that the mean offset of the stretch that follows lies
-//! within +-0.5 frame.
+//! mean. After a phase change or a kept pair that mean moves; it is pulled
+//! back within +-0.5 frame at the next point where one frame more or less
+//! goes unseen: a black run (drop an extra black frame or keep a black
+//! duplicate), a hard cut (trim a frame next to the cut, or keep a duplicate
+//! just before it) or a static frame (drop a repeat, or keep one).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -348,10 +349,22 @@ pub fn offsets(n: usize, drop: &BTreeSet<usize>, r: Ratio) -> Vec<f64> {
     off
 }
 
-/// One adjustment of the drops at a black run.
+/// Kept frames either side of a cut that a sync correction may trim, nearest
+/// to the cut first: the last frame of the old shot and the first of the new
+/// one are pure trims; the second ones skip a frame right next to the cut.
+pub const CUT_TRIM: usize = 2;
+/// Frames before a cut searched for a dropped duplicate to keep instead.
+pub const CUT_KEEP_WINDOW: usize = 6;
+
+/// One adjustment of the frame count for A/V sync.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Correction {
-    pub black_run: [usize; 2],
+    /// "black" (a black run), "cut" (a hard cut) or "static" (a frame that
+    /// repeats its predecessor).
+    pub at: &'static str,
+    /// The black run [start, end), the cut's first frame [c, c], or the
+    /// static frame [i, i].
+    pub frames: [usize; 2],
     pub action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<usize>,
@@ -362,68 +375,189 @@ pub struct Correction {
     pub mean_offset_before: Option<f64>,
 }
 
-/// Adjust drops inside black runs so that the mean offset of the stretch
-/// after each run is within +-`max_off` (Python default 0.5). `events`:
-/// display indices where the offset can jump outside a black run (phase
-/// changes at hard cuts, kept pairs). Returns (drop, corrections).
-pub fn sync_correct(
-    disp: &[&Picture],
-    drop: &BTreeSet<usize>,
-    r: Ratio,
-    black: &[(usize, usize)],
-    events: &[usize],
-    max_off: f64,
-) -> (BTreeSet<usize>, Vec<Correction>) {
+/// Where the frame count can change invisibly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Point {
+    /// A black run [s, e): drop an extra black frame or keep a black duplicate.
+    Black(usize, usize),
+    /// A hard cut at c (c starts the new shot): trim the old shot's last
+    /// frame, or keep a duplicate just before the cut.
+    Cut(usize),
+    /// Frame i repeats its predecessor: drop it, or keep a dropped duplicate
+    /// there when the next frame repeats too.
+    Static(usize),
+}
+
+impl Point {
+    /// First frame of the stretch whose mean offset the point corrects.
+    fn from(self) -> usize {
+        match self {
+            Point::Black(_, e) => e,
+            Point::Cut(c) | Point::Static(c) => c,
+        }
+    }
+}
+
+/// What [`sync_correct`] needs besides the drops.
+pub struct SyncInputs<'a> {
+    pub disp: &'a [&'a Picture],
+    pub r: Ratio,
+    pub black: &'a [(usize, usize)],
+    /// First frames of new shots (`cadence::hard_cuts`).
+    pub cuts: &'a [usize],
+    /// Proxy differences of each frame to its predecessor.
+    pub mad: &'a [f64],
+    pub bmax: &'a [f64],
+    /// Display indices where the offset can jump outside a correction point
+    /// (phase changes at hard cuts, kept pairs).
+    pub events: &'a [usize],
+    /// Both twins of every duplicate pair: never dropped at a static point,
+    /// since the other twin may already be gone.
+    pub twins: &'a BTreeSet<usize>,
+    /// Pictures other drops depend on (substitute twins, rebuild pictures).
+    pub protect: &'a BTreeSet<usize>,
+    /// A picture that can be dropped without changing any other picture
+    /// (non-reference, or a reference nothing reads), not an IDR.
+    pub cheap: &'a dyn Fn(usize) -> bool,
+    /// Largest acceptable |mean offset| of a stretch, in output frames.
+    pub max_off: f64,
+}
+
+/// Prefix sums of the kept frames' offsets, for O(1) stretch means.
+struct OffsetSums {
+    sum: Vec<f64>,
+    cnt: Vec<usize>,
+}
+
+impl OffsetSums {
+    fn new(n: usize, drop: &BTreeSet<usize>, r: Ratio) -> Self {
+        let off = offsets(n, drop, r);
+        let mut sum = vec![0.0; n + 1];
+        let mut cnt = vec![0; n + 1];
+        for (i, v) in off.iter().enumerate() {
+            let kept = v.is_finite();
+            sum[i + 1] = sum[i] + if kept { *v } else { 0.0 };
+            cnt[i + 1] = cnt[i] + usize::from(kept);
+        }
+        OffsetSums { sum, cnt }
+    }
+
+    /// Mean offset of the kept frames in [a, b), NaN if there are none.
+    fn mean(&self, a: usize, b: usize) -> f64 {
+        let c = self.cnt[b] - self.cnt[a];
+        if c == 0 { f64::NAN } else { (self.sum[b] - self.sum[a]) / c as f64 }
+    }
+}
+
+/// Frame i is a visually lossless repeat of its predecessor.
+fn repeats(mad: &[f64], bmax: &[f64], i: usize) -> bool {
+    i < mad.len() && mad[i] < INVISIBLE_MAD && bmax[i] < INVISIBLE_BMAX
+}
+
+/// Adjust the frame count at black runs, hard cuts and static frames so that
+/// the mean offset of every stretch stays within +-`max_off`. Points are
+/// taken in display order, so a drift is corrected at the first point after
+/// it; each corrects the stretch from itself to the next black run or event.
+/// Returns (drop, corrections).
+pub fn sync_correct(drop: &BTreeSet<usize>, s: &SyncInputs) -> (BTreeSet<usize>, Vec<Correction>) {
+    let disp = s.disp;
     let n = disp.len();
     let mut drop = drop.clone();
     let mut corrections = Vec::new();
-    let mut stops: BTreeSet<usize> = black.iter().map(|&(s, _)| s).collect();
-    stops.extend(events.iter().copied());
+    let mut stops: BTreeSet<usize> = s.black.iter().map(|&(a, _)| a).collect();
+    stops.extend(s.events.iter().copied());
     stops.insert(n);
-    for &(s, e) in black {
-        let mut nxt = stops.range(e..).next().copied().unwrap_or(n);
-        if nxt <= e {
-            nxt = stops.range(e + 1..).next().copied().unwrap_or(n).min(n);
-        }
-        if nxt <= e {
-            continue;
-        }
-        for _ in 0..4 {
-            let off = offsets(n, &drop, r);
-            let m = np::nanmean_f64(&off[e..nxt]);
-            if m.abs() <= max_off {
+    let in_black = |i: usize| s.black.iter().any(|&(a, e)| a <= i && i <= e);
+
+    let mut points: Vec<Point> = s.black.iter().map(|&(a, e)| Point::Black(a, e)).collect();
+    points.extend(s.cuts.iter().filter(|&&c| c > 0 && c < n && !in_black(c)).map(|&c| Point::Cut(c)));
+    points.extend((1..n).filter(|&i| repeats(s.mad, s.bmax, i) && !in_black(i)).map(Point::Static));
+    points.sort_by_key(|p| (p.from(), *p));
+
+    let mut sums = OffsetSums::new(n, &drop, s.r);
+    for p in points {
+        let from = p.from();
+        let Some(&nxt) = stops.range(from + 1..).next() else { continue };
+        let tries = if matches!(p, Point::Black(..)) { 4 } else { 1 };
+        for _ in 0..tries {
+            let m = sums.mean(from, nxt);
+            if m.is_nan() || m.abs() <= s.max_off {
                 break;
             }
-            if m > max_off {
-                // drop one more black frame: a non-reference picture in the run
-                let cand = (s..e).rev().find(|i| !drop.contains(i) && disp[*i].ref_idc == 0 && !disp[*i].idr);
-                let Some(c) = cand else {
-                    corrections.push(Correction { black_run: [s, e], action: "none possible", display: None, mean_offset: Some(m), mean_offset_before: None });
-                    break;
-                };
-                drop.insert(c);
-                corrections.push(Correction {
-                    black_run: [s, e],
-                    action: "drop extra black frame",
-                    display: Some(c),
-                    mean_offset: None,
-                    mean_offset_before: Some(np::round(m, 3)),
-                });
+            let too_many = m > s.max_off;
+            let pick: Option<(usize, &'static str)> = match p {
+                Point::Black(a, e) => {
+                    if too_many {
+                        (a..e)
+                            .rev()
+                            .find(|&i| !drop.contains(&i) && disp[i].ref_idc == 0 && !disp[i].idr && !s.protect.contains(&i))
+                            .map(|i| (i, "drop extra black frame"))
+                    } else {
+                        (a..e).rev().find(|i| drop.contains(i)).map(|i| (i, "keep black duplicate"))
+                    }
+                }
+                Point::Cut(c) => {
+                    if too_many {
+                        const ACTIONS: [[&str; 2]; 2] = [
+                            ["drop last frame of shot", "drop first frame of shot"],
+                            ["drop second-last frame of shot", "drop second frame of shot"],
+                        ];
+                        let before: Vec<usize> = (0..c).rev().filter(|i| !drop.contains(i)).take(CUT_TRIM).collect();
+                        let after: Vec<usize> = (c..nxt).filter(|i| !drop.contains(i)).take(CUT_TRIM).collect();
+                        (0..CUT_TRIM)
+                            .flat_map(|k| [(k, 0, before.get(k)), (k, 1, after.get(k))])
+                            .find_map(|(k, side, i)| {
+                                let i = *i?;
+                                ((s.cheap)(i) && !s.protect.contains(&i)).then_some((i, ACTIONS[k][side]))
+                            })
+                    } else {
+                        (c.saturating_sub(CUT_KEEP_WINDOW)..c)
+                            .rev()
+                            .find(|i| drop.contains(i))
+                            .map(|i| (i, "keep duplicate before cut"))
+                    }
+                }
+                Point::Static(i) => {
+                    if too_many {
+                        (!drop.contains(&i) && !s.twins.contains(&i) && (s.cheap)(i) && !s.protect.contains(&i))
+                            .then_some((i, "drop static frame"))
+                    } else {
+                        (drop.contains(&i) && repeats(s.mad, s.bmax, i + 1)).then_some((i, "keep static duplicate"))
+                    }
+                }
+            };
+            let Some((i, action)) = pick else {
+                if let Point::Black(a, e) = p {
+                    corrections.push(Correction {
+                        at: "black",
+                        frames: [a, e],
+                        action: "none possible",
+                        display: None,
+                        mean_offset: Some(m),
+                        mean_offset_before: None,
+                    });
+                }
+                break;
+            };
+            if too_many {
+                drop.insert(i);
             } else {
-                let cand = (s..e).rev().find(|i| drop.contains(i));
-                let Some(c) = cand else {
-                    corrections.push(Correction { black_run: [s, e], action: "none possible", display: None, mean_offset: Some(m), mean_offset_before: None });
-                    break;
-                };
-                drop.remove(&c);
-                corrections.push(Correction {
-                    black_run: [s, e],
-                    action: "keep black duplicate",
-                    display: Some(c),
-                    mean_offset: None,
-                    mean_offset_before: Some(np::round(m, 3)),
-                });
+                drop.remove(&i);
             }
+            let (at, frames) = match p {
+                Point::Black(a, e) => ("black", [a, e]),
+                Point::Cut(c) => ("cut", [c, c]),
+                Point::Static(i) => ("static", [i, i]),
+            };
+            corrections.push(Correction {
+                at,
+                frames,
+                action,
+                display: Some(i),
+                mean_offset: None,
+                mean_offset_before: Some(np::round(m, 3)),
+            });
+            sums = OffsetSums::new(n, &drop, s.r);
         }
     }
     (drop, corrections)
@@ -534,6 +668,8 @@ pub struct PlanInputs<'a> {
     pub rebuildable: Option<&'a RebuildableFn<'a>>,
     pub explicit: bool,
     pub black: &'a [(usize, usize)],
+    /// First frames of new shots.
+    pub cuts: &'a [usize],
     pub r: Ratio,
     pub fps_out: Ratio,
     pub cadence: &'a CadenceReport,
@@ -554,7 +690,7 @@ pub struct PlanOutput {
 }
 
 /// `Run.plan` without the header-dependent callbacks and logging: choose the
-/// drops, correct the A/V sync at black runs, and build the report sections.
+/// drops, correct the A/V sync, and build the report sections.
 pub fn run_plan(inp: &PlanInputs) -> PlanOutput {
     let n = inp.disp.len();
     let ch = choose_drops(inp.disp, inp.dup, inp.free, Some((inp.mad, inp.bmax)), inp.visible_subs, inp.rebuildable, inp.explicit);
@@ -562,7 +698,44 @@ pub fn run_plan(inp: &PlanInputs) -> PlanOutput {
     let n_nonref = n_planned as i64 - ch.hard.len() as i64 - ch.freed.len() as i64 - ch.subs.len() as i64 - ch.rebuilds.len() as i64;
     let mut events: Vec<usize> = inp.cadence.phase_changes.iter().filter(|c| c.at == "cut").map(|c| c.display).collect();
     events.extend(ch.unsupported.iter().map(|u| u.display));
-    let (drop, corrections) = sync_correct(inp.disp, &ch.drop, inp.r, inp.black, &events, 0.5);
+    let mut twins = BTreeSet::new();
+    for n in (1..inp.dup.len()).filter(|&i| inp.dup[i]) {
+        twins.insert(n - 1);
+        twins.insert(n);
+    }
+    // the kept twin of a hard or freed pair may be the dropped one's substitute
+    let mut protect: BTreeSet<usize> = BTreeSet::new();
+    for h in &ch.hard {
+        protect.extend([h.kept_display, h.dropped_display]);
+    }
+    for f in &ch.freed {
+        protect.extend([f.display, if f.twin == "later" { f.display - 1 } else { f.display + 1 }]);
+    }
+    let disp_of: BTreeMap<usize, usize> = inp.disp.iter().enumerate().map(|(i, p)| (p.dec, i)).collect();
+    for rb in &ch.rebuilds {
+        protect.insert(rb.kept_display);
+        protect.insert(rb.dropped_display);
+        protect.extend(rb.b_dec.iter().filter_map(|b| disp_of.get(b).copied()));
+    }
+    let free = inp.free;
+    let cheap = |i: usize| {
+        let p = inp.disp[i];
+        !p.idr && (p.ref_idc == 0 || free.is_some_and(|f| f(p.dec)))
+    };
+    let sync = SyncInputs {
+        disp: inp.disp,
+        r: inp.r,
+        black: inp.black,
+        cuts: inp.cuts,
+        mad: inp.mad,
+        bmax: inp.bmax,
+        events: &events,
+        twins: &twins,
+        protect: &protect,
+        cheap: &cheap,
+        max_off: 0.5,
+    };
+    let (drop, corrections) = sync_correct(&ch.drop, &sync);
     let hard: Vec<Hard> = ch.hard.iter().filter(|h| drop.contains(&h.dropped_display)).cloned().collect();
     let rebuilds: Vec<Rebuild> = ch
         .rebuilds
@@ -626,6 +799,8 @@ struct PlanFile {
     visible_subs: bool,
     explicit: bool,
     black: Vec<(usize, usize)>,
+    #[serde(default)]
+    cuts: Vec<usize>,
     r: (i64, i64),
     fps_out: (i64, i64),
     cadence: CadenceIn,
@@ -751,6 +926,7 @@ pub fn dev_plan(args: &[String]) -> Result<()> {
         rebuildable: if rb_tab.is_some() { Some(&rebuildable) } else { None },
         explicit: inp.explicit,
         black: &inp.black,
+        cuts: &inp.cuts,
         r,
         fps_out: Ratio::new(inp.fps_out.0, inp.fps_out.1),
         cadence: &cadence,
@@ -781,5 +957,103 @@ mod tests {
         let st = sync_stats(5, &drop, Ratio::new(4, 5), 24.0);
         assert_eq!(st.kept_frames, 4);
         assert_eq!(st.ideal_frames, 4.0);
+    }
+
+    /// 200 non-reference frames with a 4/5 cadence (duplicates at i % 5 == 4,
+    /// all dropped), no motion anywhere except where `still` says otherwise.
+    struct Scene {
+        pics: Vec<Picture>,
+        drop: BTreeSet<usize>,
+        twins: BTreeSet<usize>,
+        mad: Vec<f64>,
+        cuts: Vec<usize>,
+        events: Vec<usize>,
+        protect: BTreeSet<usize>,
+    }
+
+    impl Scene {
+        fn new() -> Self {
+            let n = 200;
+            let pics = (0..n).map(|i| Picture { dec: i, ..Default::default() }).collect();
+            let drop: BTreeSet<usize> = (0..n).filter(|i| i % 5 == 4).collect();
+            let twins = drop.iter().flat_map(|&i| [i - 1, i]).collect();
+            Scene { pics, drop, twins, mad: vec![5.0; n], cuts: vec![], events: vec![], protect: BTreeSet::new() }
+        }
+
+        fn run(&self) -> (BTreeSet<usize>, Vec<Correction>) {
+            let disp: Vec<&Picture> = self.pics.iter().collect();
+            let cheap = |i: usize| self.pics[i].ref_idc == 0;
+            let s = SyncInputs {
+                disp: &disp,
+                r: Ratio::new(4, 5),
+                black: &[],
+                cuts: &self.cuts,
+                mad: &self.mad,
+                bmax: &self.mad,
+                events: &self.events,
+                twins: &self.twins,
+                protect: &self.protect,
+                cheap: &cheap,
+                max_off: 0.5,
+            };
+            sync_correct(&self.drop, &s)
+        }
+    }
+
+    #[test]
+    fn kept_pair_is_trimmed_at_the_next_cut() {
+        let mut sc = Scene::new();
+        sc.drop.remove(&49);
+        sc.events.push(49);
+        sc.cuts = vec![100, 150];
+        let (drop, corr) = sc.run();
+        assert_eq!(corr.len(), 1);
+        assert_eq!((corr[0].at, corr[0].action, corr[0].display), ("cut", "drop last frame of shot", Some(98)));
+        assert!(drop.contains(&98));
+        // without the kept pair nothing changes
+        let (drop, corr) = Scene { cuts: vec![100], ..Scene::new() }.run();
+        assert!(corr.is_empty());
+        assert_eq!(drop, Scene::new().drop);
+    }
+
+    #[test]
+    fn cut_trim_order() {
+        let mut sc = Scene::new();
+        sc.drop.remove(&49);
+        sc.events.push(49);
+        sc.cuts = vec![100];
+        sc.pics[98].ref_idc = 1; // last kept before the cut (99 is a dropped duplicate)
+        let (_, corr) = sc.run();
+        assert_eq!((corr[0].action, corr[0].display), ("drop first frame of shot", Some(100)));
+        sc.protect.insert(100);
+        let (_, corr) = sc.run();
+        assert_eq!((corr[0].action, corr[0].display), ("drop second-last frame of shot", Some(97)));
+        sc.pics[97].ref_idc = 1;
+        let (_, corr) = sc.run();
+        assert_eq!((corr[0].action, corr[0].display), ("drop second frame of shot", Some(101)));
+    }
+
+    #[test]
+    fn too_few_frames_keeps_a_duplicate_before_the_cut() {
+        let mut sc = Scene::new();
+        sc.drop.insert(30);
+        sc.events.push(30);
+        sc.cuts = vec![101];
+        let (drop, corr) = sc.run();
+        assert_eq!((corr[0].action, corr[0].display), ("keep duplicate before cut", Some(99)));
+        assert!(!drop.contains(&99) && drop.contains(&30));
+    }
+
+    #[test]
+    fn static_frames_but_never_a_twin() {
+        let mut sc = Scene::new();
+        sc.drop.remove(&49);
+        sc.events.push(49);
+        sc.mad[118] = 0.0; // twin of the duplicate at 119
+        sc.mad[121] = 0.1;
+        let (drop, corr) = sc.run();
+        assert_eq!(corr.len(), 1);
+        assert_eq!((corr[0].at, corr[0].action, corr[0].display), ("static", "drop static frame", Some(121)));
+        assert!(drop.contains(&121) && !drop.contains(&118));
     }
 }

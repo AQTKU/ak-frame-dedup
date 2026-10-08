@@ -325,6 +325,7 @@ struct Loaded {
     fps_out: Ratio,
     r: Ratio,
     black: Vec<(usize, usize)>,
+    cuts: Vec<usize>,
     dup: Vec<bool>,
     cadence: CadenceReport,
 }
@@ -516,7 +517,7 @@ impl Run {
             an.dup.iter().filter(|&&d| d).count()
         ));
         self.rep.cadence = Some(cad.clone());
-        Ok(Loaded { es, spss, ppss, pics, explicit, fps_in, feat, fps_out, r, black: an.black.clone(), dup: an.dup.clone(), cadence: cad })
+        Ok(Loaded { es, spss, ppss, pics, explicit, fps_in, feat, fps_out, r, black: an.black.clone(), cuts: an.cuts.clone(), dup: an.dup.clone(), cadence: cad })
     }
 
     // ------------------------------------------------------------------
@@ -572,6 +573,7 @@ impl Run {
             rebuildable: if self.a.no_rebuild { None } else { Some(&rebuildable) },
             explicit: ld.explicit,
             black: &ld.black,
+            cuts: &ld.cuts,
             r: ld.r,
             fps_out: ld.fps_out,
             cadence: &ld.cadence,
@@ -593,7 +595,13 @@ impl Run {
             self.log(&format!("  unsupported pair at display {} ({}): {}; both kept", u.display, u.types, u.reason));
         }
         for c in &rep.sync.corrections {
-            self.log(&format!("  sync correction in black run [{}, {}]: {}", c.black_run[0], c.black_run[1], c.action));
+            let at = match c.at {
+                "black" => format!("black run [{}, {}]", c.frames[0], c.frames[1]),
+                "cut" => format!("cut at {}", c.frames[0]),
+                _ => format!("static frame {}", c.frames[0]),
+            };
+            let what = c.display.map_or(String::new(), |d| format!(" (display {d})"));
+            self.log(&format!("  sync correction at {at}: {}{what}", c.action));
         }
         let st = &rep.sync.stats;
         self.log(&format!(

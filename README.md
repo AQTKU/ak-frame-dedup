@@ -147,18 +147,33 @@ byte-identical output: see "Rust port" below.
       one real frame but keeps A/V sync. `--keep-idr-pairs` keeps both twins
       instead, as the brief specified;
    8. if there is no candidate, keep both twins (*unsupported*) and correct
-      the count at the next black run.
+      the count at the next sync point (step 7).
 
    Rules 1-4 leave every other frame bit-exact. Rule 6 changes only the
    non-reference B pictures that used K as their forward anchor.
 7. **A/V sync**.
    - Kept frame n becomes output frame k at k/fps_out; its offset is
      k − n·r output frames.
-   - At every black run, one extra black frame is dropped (a non-reference
-     one) or one black duplicate is kept, so that the mean offset of the
-     stretch after the run is within ±0.5 frame.
-   - Phase changes at hard cuts, and unsupported pairs, are corrected at
-     the next black run.
+   - Inside a stretch of constant phase the offset cycles around a constant
+     mean. Phase changes at hard cuts and unsupported pairs move that mean
+     (phase changes at black runs are corrected inside the run).
+   - The mean is pulled back within ±0.5 frame at the first **sync point**
+     after it moves, where one frame more or less goes unseen:
+     - a **black run**: one extra black frame is dropped (a non-reference
+       one), or one black duplicate is kept;
+     - a **hard cut**: one frame next to the cut is dropped, nearest first:
+       the last frame of the old shot or the first of the new one (a pure
+       trim, as an editor would make), then the second-last or second frame.
+       Or the dropped duplicate nearest before the cut (within 6 frames) is
+       kept;
+     - a **static frame**, a visually lossless repeat of its predecessor
+       (the rule-4 test) that is not a duplicate twin: it is dropped, or a
+       dropped duplicate there is kept when the next frame repeats too.
+   - Only cheap pictures (non-reference, or a reference nothing reads) are
+     dropped, never an IDR, a substitute twin or a rebuild picture, so every
+     other frame stays bit-exact.
+   - Each correction is in the report's `sync.corrections` (`at`: black,
+     cut or static).
 8. **Write** (`stream.write_stream`).
    - Pictures are dropped and frame_num is renumbered up to the next IDR.
    - Every in-band SPS gets its VUI timing patched in place:
@@ -451,9 +466,9 @@ was run with `--verify` and default settings.
 | | |
 |---|---|
 | input rate / detected source rate | 29.97 / 23.976, score 9.60 |
-| frames in → out | 150,499 → 120,401 |
+| frames in → out | 150,499 → 120,400 |
 | chunks / phase changes | 9 / 10 (8 at black runs, 2 at hard cuts) |
-| drops | 30,098, of which 88% are non-reference B pictures (bit-exact) |
+| drops | 30,099, of which 88% are non-reference B pictures (bit-exact); one is a sync trim, the first frame of a shot after the phase change at a cut |
 | unreferenced reference twins dropped (bit-exact) | 382 |
 | hard pairs (measured repair) | 2,716 |
 | anchor rebuilds (fallbacks) | 423 (0). They chain: up to 18 IDR periods merge into one. |
@@ -461,11 +476,11 @@ was run with `--verify` and default settings.
 | slice headers rewritten | 60,319 |
 | repair | 149,483 PCM MBs, +56.2 MB (1.0%) |
 | pictures left over the drift threshold | 291, all at the 2% PCM cap; visible worst 56 |
-| verify: bit-exact / differing frames | 73,476 / 46,925. The differing frames are noise-level drift, all inside hard-drop neighbourhoods and rebuilt leading pictures. |
+| verify: bit-exact / differing frames | 73,476 / 46,924. The differing frames are noise-level drift, all inside hard-drop neighbourhoods and rebuilt leading pictures. |
 | differing anywhere else / decoder errors | 0 / 0 |
 | output size | 5.59 GB (input 6.04 GB) |
-| video − audio duration change | +0.076 s. Two phase changes at hard cuts in the last 3 minutes have no black run after them. |
-| runtime | 94 min (repair 79 min on 9 workers, verify 14 min) |
+| video − audio duration change | +0.034 s (0.076 s before cuts became sync points: the two phase changes at hard cuts in the last 3 minutes have no black run after them). Sync offset: max 1.4 frames, final 0.6. |
+| runtime | 94 min in Python v1.2.0 (repair 79 min on 9 workers, verify 14 min); 33 min in Rust 2.0 |
 
 On a 5-minute clip of the same file (154 hard pairs), the frames that
 differ have a median frame MAD of 0.11. Their median worst pixel is 9, and
@@ -575,9 +590,10 @@ given only the raw output stream with no `--default-duration`, infers
   It drops one real frame next to a duplicate that had to be kept: a
   one-frame stutter. `--keep-idr-pairs` keeps both twins instead and accepts
   A/V drift.
-- A file with no black run of 0.5 s or more cannot correct the sync offset
-  after a mid-chunk phase change or an unsupported pair. The offset is
-  reported.
+- The sync offset after a mid-chunk phase change or an unsupported pair
+  lasts until the next sync point where a cheap picture is available (a
+  black run, a static frame, or a cut with a non-reference picture next to
+  it). The offsets are reported.
 - Native-rate intros (logos) are forced through the content cadence, which
   can drop real frames there. This is by design: the output is always CFR.
 - The likelihood tables were trained on one file from this encoder. Other

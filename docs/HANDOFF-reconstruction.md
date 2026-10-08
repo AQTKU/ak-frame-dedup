@@ -135,7 +135,7 @@ Their hard drops leave 1-8 levels around PCM patches from deblocking across PCM 
 | substitutes | 13 invisible, **0 visible** |
 | unsupported pairs | 0 |
 | headers rewritten | 60,319; 423 IDRs demoted |
-| A/V | video − audio gap change +0.076 s. The two phase changes at hard cuts near the end have no black run after them to absorb the correction (an existing limitation). |
+| A/V | video − audio gap change +0.076 s. The two phase changes at hard cuts near the end have no black run after them to absorb the correction. Since 2.0.0 cuts are sync points too: one trim at the cut brings it to +0.034 s. |
 
 ### First run: two defects, since fixed
 
