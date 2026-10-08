@@ -16,6 +16,8 @@ frame-dedup in.mkv -o out.mkv [--report r.json] [--verify]
             [--mb-report mb.json [--mb-threshold N]]
             [--work DIR] [--keep-work] [--workers N]
             [--no-rebuild] [--keep-idr-pairs] [--dry-run]
+            [--no-corrections] [--drift-threshold N] [--pcm-threshold N]
+            [--drift-budget F]
 ```
 
 | option | meaning |
@@ -31,6 +33,10 @@ frame-dedup in.mkv -o out.mkv [--report r.json] [--verify]
 | `--no-rebuild` | never rebuild an anchor (drop rule 6 below); IDR-later pairs then use rule 7 |
 | `--keep-idr-pairs` | see drop rule 7 below |
 | `--dry-run` | detect and plan only |
+| `--no-corrections` | repair drift with I_PCM only, as 2.0 did (see "Residual corrections") |
+| `--drift-threshold N` | measured repair: correct macroblocks off by N or more (default 6; 16 with `--no-corrections`) |
+| `--pcm-threshold N` | measured repair: I_PCM for macroblocks off by N or more that no correction fixes (default 8); below it they are left |
+| `--drift-budget F` | measured repair: once an IDR period has added F times the bytes dropped from it, repair only from `--pcm-threshold` on (default 1; 0: no budget) |
 
 Exit codes:
 - 0: success.
@@ -54,14 +60,19 @@ Dev tools (`frame-dedup dev <command>`):
 - `train-model sample.mkv` retrains the likelihood tables
   (`src/cadence_model.json`).
 - `roundtrip in.h264` is the CABAC round trip.
+- `recon in.h264 [--periods A-B]` checks the inter reconstruction of
+  `recon.rs` against ffmpeg decodes without deblocking (see "Residual
+  corrections").
 - `reexpress in.h264 <P dec idx> <count>` is the motion re-expression test.
 - `headers`, `records`, `motion`, `features`, `detect` and others dump
   intermediate results as JSON.
 - `tools/e2e.ps1` runs the release build on the test files and compares
   per-stream MD5s with reference outputs.
 
-The tool is a Rust port of the Python implementation (v1.2.0), with
-byte-identical output: see "Rust port" below.
+The tool is a Rust port of the Python implementation (v1.2.0): 2.0 had
+byte-identical output (see "Rust port" below). 2.1 repairs drift with
+residual corrections (see "Residual corrections"); `--no-corrections` gives
+2.0's output.
 
 ## How it works
 
@@ -268,6 +279,10 @@ byte-identical output: see "Rust port" below.
       covering whole original periods.
     - It reports bit-exact frames, differing frames, the worst difference
       and MBs differing by 3 or more, over Y, U and V and also luma only.
+      A frame is bit-exact only if the whole coded frame is; the per-MB
+      statistics (and `--mb-report`) count only the visible area. Until 2.0
+      they included the 8 cropped rows below 1080, which made the Amazon
+      clip's worst difference 76 instead of 37.
     - Everything outside hard-drop neighbourhoods and the leading B
       pictures of rebuilt pairs must be bit-exact. A hard-drop neighbourhood
       runs from the dropped twin to the end of its IDR period. The leading B
@@ -338,6 +353,104 @@ switches to explicit mode (`explicit.rs`):
 - **Verify** treats every picture of D's IDR period decoded after D as its
   neighbourhood (here D can be the display-earlier twin).
 
+### Residual corrections (2.1)
+
+Version 2.0 repaired drift with I_PCM only. An I_PCM macroblock costs about
+370 bytes, so the measured repair could afford a threshold of 16 and a 2%
+per-picture cap. It spent 11% of the room the drops freed and left
+macroblocks off by up to 100 levels. Since 2.1 the measured repair first
+*corrects the residual* of a drifting macroblock and keeps its mode, motion
+and QP; I_PCM is the fallback. A correction costs about 30-40 bytes.
+`--no-corrections` restores 2.0's behaviour exactly.
+
+- **Reconstruction** (`recon.rs`). An inter macroblock decodes to
+  clip(prediction + residual) before deblocking. The prediction is computed
+  from frames ffmpeg has already decoded, which is exactly what motion
+  compensation reads: quarter-sample luma (6-tap), eighth-sample chroma,
+  default, explicit (P) and implicit (B) weighted prediction, all partition
+  sizes, direct included (motion from `mv::derive_motion`). The residual
+  needs dequantisation (flat scaling lists) and the 4x4, 8x8 and chroma DC
+  inverse transforms. No intra prediction and no deblocking filter are
+  needed.
+  - `frame-dedup dev recon <file.h264>` checks it: it decodes IDR periods
+    with ffmpeg's deblocking switched off (`-skip_loop_filter all`, so every
+    picture and every reference is the pre-deblocking reconstruction) and
+    rebuilds every inter macroblock. It is bit-exact on about 40 million
+    inter macroblocks of all four test files (P and B, weighted, implicit,
+    temporal and spatial direct, skip, 4x4 and 8x8 residuals). With
+    deblocking left on, 74% mismatch, so the check is not vacuous.
+- **The correction** (`recon::correct`). The levels of the macroblock are
+  changed so that its reconstruction over the new prediction comes as close
+  as the quantiser allows to a target. The change is a least-squares
+  projection of (target − current reconstruction) on each transform block's
+  basis (the integer transforms are orthogonal), repeated a few times, then
+  a greedy ±1 search on the levels of the block holding the worst sample.
+  - If the worst error is still over the limit (half the threshold, at least
+    3), the QP is lowered by 6, 12, then 18 through `mb_qp_delta`. At QP−6k
+    the original levels times 2^k dequantise to exactly the same values
+    (`recon::tests::qp_minus_6_doubles_exactly`), so the original residual
+    is kept exactly and only the correction is quantised more finely. The
+    B pictures of the Amazon file run at QP 25-35, where one level is
+    several sample values; without this most corrections stayed 5-27 off.
+  - Motion and macroblock type are kept. A P_Skip becomes P_L0_16x16 (its
+    mvd is re-solved), a B_Skip becomes B_Direct_16x16. A macroblock that
+    had no luma residual gets the 4x4 transform, which also keeps the set of
+    deblocked edges.
+  - Corrections go through `patch_pictures` like I_PCM: an inter
+    replacement record with its own QP (the QP chain is re-solved) and a
+    version for the patch cache. Unlike I_PCM it keeps its motion, so B
+    pictures that use it as co-located macroblock are unaffected.
+- **The target** is the original's pre-deblocking reconstruction (the
+  original motion over the original decoded references, plus the original
+  residual: exact), plus the difference between what deblocking did to the
+  macroblock in the original and what it does in the current decode. The
+  second term makes up for deblocking that differs, for example next to an
+  I_PCM macroblock.
+- **The prediction** reads the references *as they will be after this
+  round*: macroblocks fixed in a reference picture this round are taken as
+  the original's. Without that, a correction in a chain of references was
+  made against a reference that changed in the same round, flipped the sign
+  of the error, and left macroblocks 79 levels off.
+- **The loop** (`repair::run_task_explicit`). Every round decodes the IDR
+  period, compares it with the original and fixes every picture:
+  - macroblocks off by `--drift-threshold` (6) or more are corrected;
+  - intra macroblocks, and macroblocks no correction fixes (error over the
+    limit, three tries, or a correction that would not change), get I_PCM
+    from `--pcm-threshold` (8) on; below it they are left as they are;
+  - the last round makes no corrections, only I_PCM, since nothing measures
+    it again; up to 20 rounds (most periods need 3-6);
+  - a per-period byte budget: once a period has added more than
+    `--drift-budget` (1.0) times the bytes of the pictures dropped from it,
+    it only repairs from the I_PCM threshold on;
+  - reference frames are kept while a picture that reads them still has to
+    be handled (pictures arrive in display order, references in decode
+    order).
+- **Rebuilt pairs** (exact mode, `rebuild.rs`). The leading B pictures that
+  now read I2 instead of K get the same corrections from 8 levels on, with
+  I_PCM from 16 (no per-picture cap with corrections). They are not
+  references, so nothing propagates.
+
+What did not work, measured on the 5-minute Amazon clip at threshold 6 /
+I_PCM 8 unless noted (+11.8 MB, worst 12, as reference):
+
+| attempt | result |
+|---|---|
+| I_PCM only, thresholds 12 / 8 / 4, no cap | +11.9 / +37 / +368 MB (the drops free 24 MB) |
+| corrections at the macroblock's own QP only | 496 of 15k usable; errors 5-27 |
+| corrections against the current decode, all pictures each round | worst 79 (stale corrections in reference chains) |
+| predicted references only for first-time fixes | oscillation, worst 154 |
+| a stricter threshold (T−2) for reference pictures | +149 MB at 6: deblocking-floor I_PCM everywhere |
+| intra macroblocks re-coded as inter + residual | +29.7 MB: they never settle under their own deblocking |
+| the Canadian files through explicit mode (`--force-explicit`) | sample: +17-19 MB, 216k macroblocks differ (exact mode: 53 KB, 44k) |
+| a correction clean-up after the exact repair (threshold 2) | sample: worst 5 → 20; ±1 errors spread through P chains |
+
+I_PCM has a weakness the corrections avoid: it is an intra macroblock, so
+its edges with inter neighbours get bS 4, H.264's strong filter. That filter
+rewrites three samples deep and pulls the third towards the fourth; next to
+the dark edge of white text it moved a flat white sample by 38 levels on the
+full Amazon file. Corrections keep the macroblock inter (bS 0-2, normal
+filter, at most a few levels).
+
 ### Modules
 
 | module | role |
@@ -346,7 +459,8 @@ switches to explicit mode (`explicit.rs`):
 | `cabac.rs`, `records.rs`, `picture.rs` | CABAC slice-data codec (decode and encode through one code path, I_PCM included); macroblock records; byte-exact round trip |
 | `mv.rs` | `dpb_walk` (POC, sliding-window ref lists) and `derive_motion` (P_Skip, temporal and spatial direct, mvd solving) |
 | `reexpress.rs` | explicit re-expression of skip / direct macroblocks; motion re-expression test |
-| `patch.rs` | I_PCM macroblock patcher that keeps the rest of the picture exact (`patch_pictures`) |
+| `patch.rs` | macroblock patcher (I_PCM or corrected inter records) that keeps the rest of the picture exact (`patch_pictures`) |
+| `recon.rs` | inter prediction, dequantisation and inverse transforms of single macroblocks; residual corrections (`correct`) |
 | `rebuild.rs` | anchor rebuild: IDR demotion, period merging, list check, B1-B3 repair, recovery point SEI |
 | `explicit.rs` | explicit mode: header planning (ref_pic_list_modification + MMCO 1), slice header rewriting, explicit anchor rebuilds |
 | `evidence.rs`, `cadence.rs`, `plan.rs` | detection and drop planning |
@@ -364,7 +478,8 @@ ffmpeg decoders once crashed a machine with marginal RAM.
 - Memory-heavy pools are sized so that workers × budget stays under 40% of
   physical RAM, with the budgets measured for the Python implementation:
   0.8 GB per repair worker, 1.5 GB per explicit-mode repair worker (9
-  workers on 31.7 GB) and 0.5 GB per verify worker. The threads need much
+  workers on 31.7 GB), 2.2 GB per explicit-mode repair worker with
+  corrections (5 workers) and 0.5 GB per verify worker. The threads need much
   less; the process peak on the full Amazon file was 6.7 GB, including the
   pages of the two 6 GB streams it maps.
 - An explicit-mode repair task holds at most `PARSED_CAP` parsed pictures
@@ -416,6 +531,60 @@ derivation about 70× faster. What remains is mostly ffmpeg: the measured
 repair and the anchor rebuild decode every affected IDR period several
 times, and verify decodes everything twice.
 ## Results
+
+### Version 2.1: residual corrections
+
+Default settings, `--verify`, 32-thread / 31.7 GB machine. Difference
+counts are luma, visible area, per macroblock. The 2.0 counts of the
+full file come from 2.0's `--mb-report`, which still included the cropped
+rows (it inflates the top of the tail slightly, not its size).
+
+sample.mkv and foliage.mkv have no anchor rebuilds and no explicit
+reference control, so 2.1 leaves them untouched: their outputs are
+identical per stream to 2.0's (and to 1.2.0's). nodupes.mkv still exits
+with code 2.
+
+Amazon, 5-minute clip (the drops free 24.1 MB):
+
+| | 2.0 | 2.1 |
+|---|---|---|
+| repair: I_PCM / corrected MBs | 9,584 / 0 | 15,797 / 461,212 |
+| repair: bytes added | +3.6 MB (15% of the freed bytes) | +9.6 MB (40%) |
+| periods that hit the byte budget | | 9 of 88 |
+| MBs off by ≥ 4 / 6 / 8 / 12 / 16 / 32 | 1,212,629 / 425,432 / 176,269 / 52,958 / 15,736 / 45 | 851,204 / 43,886 / 3 / 0 / 0 / 0 |
+| worst difference | 37 | 9 |
+| runtime (repair) | 93 s (55 s) | 185 s (139 s) |
+
+Amazon, full file (the drops free 501 MB of 5,898 MB of video):
+
+| | 2.0 | 2.1 |
+|---|---|---|
+| repair: I_PCM / corrected MBs | 149,483 / 0 | 129,136 / 6,817,950 |
+| repair: bytes added | +56.2 MB (11%) | +121.9 MB (24%) |
+| output video | 5,453 MB | 5,518 MB |
+| periods that hit the byte budget | | 87 of 1,403 |
+| MBs off by ≥ 8 / 12 / 16 / 24 / 32 | 2,076,015 / 437,192 / 112,718 / 20,871 / 3,109 | 10 / 5 / 5 / 5 / 5 |
+| worst difference | 103 | 38 (one I_PCM macroblock, see "Residual corrections") |
+| differing outside hard-drop neighbourhoods | 0 | 0 |
+| runtime (repair, verify) | 33.5 min (21, 8) | 53.5 min (42, 8) |
+| peak RSS (main process) | 6.7 GB | 11.5 GB |
+
+smoke.mkv, the 592 leading B pictures of its 300 anchor rebuilds (all other
+frames are as in 2.0):
+
+| | 2.0 | 2.1 |
+|---|---|---|
+| I_PCM / corrected MBs | 19,205 / 0 | 6,360 / 289,604 |
+| bytes added | +12.3 MB | +16.8 MB |
+| MBs off by ≥ 8 / 12 / 16 / 24 / 32 | 276,812 / 67,477 / 12,800 / 2,163 / 960 | 4,150 / 1,383 / 14 / 4 / 2 |
+| worst difference | 56 | 35 |
+
+Review pages (`review/clip-2.0-worst`, `clip-2.1-worst`, `smoke-2.0-worst`,
+`smoke-2.1-worst`, served by `.claude/launch.json`) show 96x96 crops of the
+worst macroblocks of each version: original, both outputs, and their
+differences ×8.
+
+### Earlier results (1.x / 2.0)
 
 Measured on the four test files on a 32-thread / 31.7 GB machine with
 default settings:
@@ -571,18 +740,28 @@ given only the raw output stream with no `--default-duration`, infers
   MMCO operations are not. Anything else exits with code 3. Only 29.97 and
   30 fps inputs are processed.
 - Explicit mode repairs by measurement, not exactly: frames that read a
-  dropped twin keep encode-noise-level differences (below
-  `DRIFT_THRESHOLD`, or above it where the per-picture PCM budget ran out)
-  until the next IDR. See "Explicit mode" above.
-- Hard drops leave differences of 1-8 levels around the I_PCM patches.
-  They come from deblocking across PCM edges, and from intra prediction and
-  later references that read post-deblock PCM pixels. They cannot be
-  removed without the tool's own pre-deblock reconstruction.
+  dropped twin keep encode-noise-level differences until the next IDR:
+  below `--drift-threshold` (6), between it and `--pcm-threshold` (8) where
+  no correction fixes a macroblock or a period's byte budget ran out, and
+  rarely above (an I_PCM macroblock next to a sharp edge, see "Residual
+  corrections"). With `--no-corrections`, as in 2.0: below 16, or above it
+  where the 2% per-picture PCM cap ran out.
+- A correction costs the time of reconstructing macroblocks and of more
+  repair rounds: the full Amazon file takes 54 minutes instead of 34, and
+  the repair pool is smaller (2.2 GB per worker budgeted).
+- Hard drops in exact mode leave differences of 1-8 levels around the I_PCM
+  patches. They come from deblocking across PCM edges, and from intra
+  prediction and later references that read post-deblock PCM pixels.
+  Corrections do not help there: they are accurate to ±1-3 before
+  deblocking, not exact, and below a threshold of about 3 those errors
+  spread through P chains (tried: worst 5 became 20 on sample.mkv). Removing
+  them would take the tool's own deblocking filter and intra prediction.
 - An anchor rebuild changes the B pictures displayed just before the pair:
   they now read I2, a second encode of K's frame. Differences are
-  encode-noise level, except in fast motion, where the IDR twin can be coded
-  very differently from K. There the per-picture PCM budget (2% of the MBs)
-  leaves some MBs at up to about 40 levels (see Results).
+  encode-noise level; corrections bring macroblocks off by 8 or more back
+  (on smoke.mkv 14 macroblocks stay at 16 or more, worst 35, in one fast-motion pair). With
+  `--no-corrections` the 2% PCM cap leaves fast-motion pictures at up to
+  about 56 levels.
 - After a rebuild, I2 is an open-GOP random-access point rather than an
   IDR. A seek to it skips its leading B pictures, as with any open GOP.
   A player that seeks only to IDRs lands on the previous real IDR.

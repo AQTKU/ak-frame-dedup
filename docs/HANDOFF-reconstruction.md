@@ -1,5 +1,13 @@
 # Handoff: spend more of the freed bytes on repair (byte budget, then residual corrections)
 
+> **Status (2026-10-08, branch `repair-budget`, version 2.1.0):** steps 1 and 2 are done and are the
+> default; step 3 was tried and does not pay (see README, "Residual corrections" and Limitations).
+> `recon.rs` reconstructs inter MBs bit-exactly (checked with `-skip_loop_filter all` on all four
+> files); corrections use a QP ladder (QP−6k doubles levels exactly), predicted references and a
+> deblocking-aware target. Full Amazon file: MBs ≥ 8 from ~2.1M to 10, worst 103 → 38, +122 MB
+> (24% of the freed bytes). smoke.mkv's rebuilt leading B pictures: ≥ 16 from 12.8k to 27.
+> The side idea (keep both twins and trim at a sync point) is still open.
+
 This brief is for a fresh session. Read `README.md` first, especially "How it works" and "Explicit mode". `docs/HANDOFF.md` and `docs/HANDOFF-anchor-rebuild.md` are older design background; skim them only if something here is unclear.
 
 ## The goal in one paragraph

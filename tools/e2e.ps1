@@ -1,4 +1,4 @@
-# End-to-end acceptance runs of the Rust build against the v1.2.0 baselines.
+# End-to-end acceptance runs of the Rust build against the reference outputs.
 # Usage: pwsh tools/e2e.ps1 [names...]   (one at a time; per-stream MD5 compared)
 param([string[]]$Names = @('smoke', 'foliage', 'full'))
 $root = Split-Path -Parent $PSScriptRoot
@@ -7,8 +7,10 @@ $out = 'work\port\e2e'
 New-Item -ItemType Directory -Force $out | Out-Null
 $inputs = @{ sample = 'sample.mkv'; foliage = 'foliage.mkv'; smoke = 'smoke.mkv'; clip = 'work\mmco\clip.mkv'
              full = 'mmco-or-ref-list-modification.mkv' }
+# 2.1 references: sample and foliage are unchanged since 1.2.0; smoke, clip and full changed
+# with residual corrections (the 2.0 outputs are what --no-corrections gives)
 $base = @{ sample = 'work\port\baseline\sample.py.mkv'; foliage = 'work\port\baseline\foliage.py.mkv'
-           smoke = 'work\port\baseline\smoke.py.mkv'; clip = 'work\port\baseline\clip.py.mkv'; full = 'work\mmco\full_out.mkv' }
+           smoke = 'work\v21\smoke.mkv'; clip = 'work\v21\clip.mkv'; full = 'work\v21\full.mkv' }
 $workers = @{ full = 16 }
 function streamhash($f) { (ffmpeg -v error -i $f -map 0 -c copy -f streamhash -hash md5 - 2>$null) -join ';' }
 foreach ($n in $Names) {

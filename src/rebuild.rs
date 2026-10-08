@@ -268,7 +268,10 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
     let seg = &src[task.seg.clone()];
     let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
     let max_rounds = if cx.corr.is_some() { MAX_ROUNDS_CORR } else { MAX_ROUNDS };
-    for rnd in 0..max_rounds {
+    // with corrections, the last round's decisions are encoded once more
+    // (I_PCM only by then; 2.0 left them out)
+    let passes = if cx.corr.is_some() { max_rounds + 1 } else { max_rounds };
+    for rnd in 0..passes {
         repl.clear();
         for (i, &b) in bs.iter().enumerate() {
             let (dd, base, m0) = &recs[i];
@@ -280,6 +283,9 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
             stats[i].corrected = corr[i].len();
             stats[i].bytes_after = nal.len();
             repl.insert(b, nal);
+        }
+        if rnd == max_rounds {
+            break;
         }
         let entries = write_rebuilt(cx.src_es, seg, task.seg.start, cx.spss, cx.ppss, &tmp.0, std::slice::from_ref(r), &repl)?;
         let mut order: Vec<(i32, usize)> = entries.iter().map(|e| (e.poc, e.pic)).collect();
