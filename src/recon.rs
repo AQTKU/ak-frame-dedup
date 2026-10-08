@@ -504,37 +504,45 @@ pub fn residual(mb: &Mb, qp: i32, pps: &Pps) -> Result<[i32; 384]> {
     }
     for comp in 0..2 {
         let qpc = chroma_qp(qp, if comp == 0 { pps.chroma_qp_offset } else { pps.chroma_qp_offset2 });
-        // chroma DC: 2x2 Hadamard, then scale (8.5.11)
-        let mut dc = [0i32; 4];
-        if let Some(c) = &coef.cdc[comp] {
-            let c: [i32; 4] = std::array::from_fn(|i| c.get(i).copied().unwrap_or(0));
-            let f = [c[0] + c[1] + c[2] + c[3], c[0] - c[1] + c[2] - c[3], c[0] + c[1] - c[2] - c[3], c[0] - c[1] - c[2] + c[3]];
-            let ls = level_scale4((qpc % 6) as usize, 0);
-            for i in 0..4 {
-                dc[i] = ((f[i] * ls) << (qpc / 6)) >> 5;
-            }
-        }
-        let base = 256 + comp * 64;
-        for blk in 0..4 {
-            let mut d = [0i32; 16];
-            d[0] = dc[blk];
-            if let Some(lv) = &coef.cac[comp][blk] {
-                for (s, &c) in lv.iter().enumerate() {
-                    let k = ZIGZAG4[s + 1];
-                    d[k] = dequant4(c, qpc, k);
-                }
-            }
-            if d.iter().all(|&v| v == 0) {
-                continue;
-            }
-            let r = idct4(&d);
-            let (ox, oy) = ((blk % 2) * 4, (blk / 2) * 4);
-            for k in 0..16 {
-                out[base + (oy + k / 4) * 8 + ox + k % 4] = r[k];
-            }
-        }
+        let r = chroma_residual(coef.cdc[comp].as_deref(), &coef.cac[comp], qpc);
+        out[256 + comp * 64..256 + comp * 64 + 64].copy_from_slice(&r);
     }
     Ok(out)
+}
+
+/// The residual of one chroma component (8x8, row-major) from its DC and AC
+/// levels at chroma QP `qpc`.
+fn chroma_residual(cdc: Option<&[i32]>, cac: &[Option<Vec<i32>>; 4], qpc: i32) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    // chroma DC: 2x2 Hadamard, then scale (8.5.11)
+    let mut dc = [0i32; 4];
+    if let Some(c) = cdc {
+        let c: [i32; 4] = std::array::from_fn(|i| c.get(i).copied().unwrap_or(0));
+        let f = [c[0] + c[1] + c[2] + c[3], c[0] - c[1] + c[2] - c[3], c[0] + c[1] - c[2] - c[3], c[0] - c[1] - c[2] + c[3]];
+        let ls = level_scale4((qpc % 6) as usize, 0);
+        for i in 0..4 {
+            dc[i] = ((f[i] * ls) << (qpc / 6)) >> 5;
+        }
+    }
+    for blk in 0..4 {
+        let mut d = [0i32; 16];
+        d[0] = dc[blk];
+        if let Some(lv) = &cac[blk] {
+            for (s, &c) in lv.iter().enumerate() {
+                let k = ZIGZAG4[s + 1];
+                d[k] = dequant4(c, qpc, k);
+            }
+        }
+        if d.iter().all(|&v| v == 0) {
+            continue;
+        }
+        let r = idct4(&d);
+        let (ox, oy) = ((blk % 2) * 4, (blk / 2) * 4);
+        for k in 0..16 {
+            out[(oy + k / 4) * 8 + ox + k % 4] = r[k];
+        }
+    }
+    out
 }
 
 /// Luma QP of every macroblock of a slice that starts at slice QP `qp`.
@@ -760,6 +768,12 @@ fn luma_block(levels: Option<&Vec<i32>>, t8: bool, qp: i32) -> Vec<i32> {
     }
 }
 
+/// The score of the union of two disjoint sets of samples.
+fn score_union(a: (i32, usize, i64), b: (i32, usize, i64)) -> (i32, usize, i64) {
+    let m = a.0.max(b.0);
+    (m, if a.0 == m { a.1 } else { 0 } + if b.0 == m { b.1 } else { 0 }, a.2 + b.2)
+}
+
 /// (max |error|, samples at the max, sum of squares): smaller is better.
 fn score(err: impl Iterator<Item = i32>) -> (i32, usize, i64) {
     let (mut m, mut n, mut ss) = (0, 0, 0i64);
@@ -807,63 +821,79 @@ fn refine(c: Correction, pps: &Pps, pred: &[u8; 384], target: &[u8; 384]) -> Res
                 let (bx, by) = BLK_XY[blk];
                 ((0..16).map(|k| (by * 4 + k / 4) * 16 + bx * 4 + k % 4).collect(), blk)
             };
-            let outside = {
-                let mut v = e.clone();
-                for &i in &cells {
-                    v[i] = 0;
-                }
-                v
-            };
+            // the samples outside the block do not change
+            let mut inside = [false; 384];
+            for &i in &cells {
+                inside[i] = true;
+            }
+            let outside = score((0..384).filter(|&i| !inside[i]).map(|i| e[i]));
             let coef = n.coef.as_ref().expect("set above");
-            let levels = if t8 { coef.l8[slot].clone() } else { coef.l4[slot].clone() };
             let len = if t8 { 64 } else { 16 };
+            let mut l = if t8 { coef.l8[slot].clone() } else { coef.l4[slot].clone() }.unwrap_or_else(|| vec![0; len]);
+            l.resize(len, 0);
+            let mut pick: Option<((i32, usize, i64), usize, i32)> = None;
             for p in 0..len {
                 for dir in [1, -1] {
-                    let mut l = levels.clone().unwrap_or_else(|| vec![0; len]);
-                    l.resize(len, 0);
                     l[p] += dir;
                     let r = luma_block(Some(&l), t8, qp);
-                    let mut v = outside.clone();
-                    for (k, &i) in cells.iter().enumerate() {
-                        v[i] = target[i] as i32 - clip1(pred[i] as i32 + r[k]);
-                    }
-                    let sc = score(v.into_iter());
-                    if sc < cur && best.as_ref().is_none_or(|b| sc < b.0) {
-                        let mut m = n.clone();
-                        let cf = m.coef.as_mut().expect("set above");
-                        if t8 {
-                            cf.l8[slot] = Some(l);
-                        } else {
-                            cf.l4[slot] = Some(l);
-                        }
-                        best = Some((sc, m));
+                    l[p] -= dir;
+                    let sc = score_union(outside, score(cells.iter().enumerate().map(|(k, &i)| target[i] as i32 - clip1(pred[i] as i32 + r[k]))));
+                    if sc < cur && pick.as_ref().is_none_or(|b| sc < b.0) {
+                        pick = Some((sc, p, dir));
                     }
                 }
+            }
+            if let Some((sc, p, dir)) = pick {
+                l[p] += dir;
+                let mut m = n.clone();
+                let cf = m.coef.as_mut().expect("set above");
+                if t8 {
+                    cf.l8[slot] = Some(l);
+                } else {
+                    cf.l4[slot] = Some(l);
+                }
+                best = Some((sc, m));
             }
         } else {
             // chroma: the block's AC levels and the component's DC levels
             let comp = (s - 256) / 64;
             let k = (s - 256) % 64;
             let blk = (k / 8 / 4) * 2 + (k % 8) / 4;
+            // only this component's samples change
+            let base = 256 + comp * 64;
+            let outside = score((0..384).filter(|&i| !(base..base + 64).contains(&i)).map(|i| e[i]));
+            let qpc = chroma_qp(qp, if comp == 0 { pps.chroma_qp_offset } else { pps.chroma_qp_offset2 });
+            // a +-1 on one level, as the record holds it
+            let edit = |slot: usize, dir: i32, dc: &mut Option<Vec<i32>>, ac: &mut [Option<Vec<i32>>; 4]| {
+                if slot < 4 {
+                    let v = dc.get_or_insert_with(|| vec![0; 4]);
+                    v.resize(4, 0);
+                    v[slot] += dir;
+                } else {
+                    let v = ac[blk].get_or_insert_with(|| vec![0; 15]);
+                    v.resize(15, 0);
+                    v[slot - 4] += dir;
+                }
+            };
+            let cf = n.coef.as_ref().expect("set above");
+            let mut pick: Option<((i32, usize, i64), usize, i32)> = None;
             for slot in 0..19 {
                 for dir in [1, -1] {
-                    let mut m = n.clone();
-                    let cf = m.coef.as_mut().expect("set above");
-                    if slot < 4 {
-                        let v = cf.cdc[comp].get_or_insert_with(|| vec![0; 4]);
-                        v.resize(4, 0);
-                        v[slot] += dir;
-                    } else {
-                        let v = cf.cac[comp][blk].get_or_insert_with(|| vec![0; 15]);
-                        v.resize(15, 0);
-                        v[slot - 4] += dir;
-                    }
-                    let r = residual(&m, qp, pps)?;
-                    let sc = score((0..384).map(|i| target[i] as i32 - clip1(pred[i] as i32 + r[i])));
-                    if sc < cur && best.as_ref().is_none_or(|b| sc < b.0) {
-                        best = Some((sc, m));
+                    let (mut dc, mut ac) = (cf.cdc[comp].clone(), cf.cac[comp].clone());
+                    edit(slot, dir, &mut dc, &mut ac);
+                    let r = chroma_residual(dc.as_deref(), &ac, qpc);
+                    let sc = score_union(outside, score((0..64).map(|i| target[base + i] as i32 - clip1(pred[base + i] as i32 + r[i]))));
+                    if sc < cur && pick.as_ref().is_none_or(|b| sc < b.0) {
+                        pick = Some((sc, slot, dir));
                     }
                 }
+            }
+            if let Some((sc, slot, dir)) = pick {
+                let mut m = n.clone();
+                let cf = m.coef.as_mut().expect("set above");
+                let (dc, ac) = (&mut cf.cdc[comp], &mut cf.cac[comp]);
+                edit(slot, dir, dc, ac);
+                best = Some((sc, m));
             }
         }
         match best {

@@ -27,8 +27,10 @@ pub const REPAIR_PEAK: f64 = 0.8e9;
 /// Explicit-mode repair worker (holds a whole IDR period's frames).
 pub const REPAIR_PEAK_EXPLICIT: f64 = 1.5e9;
 /// Per-worker peak of the measured repair with residual corrections: it also
-/// keeps reference frames, corrected records and their target samples.
-pub const REPAIR_PEAK_CORR: f64 = 2.2e9;
+/// keeps reference frames, corrected records, their target samples, and
+/// (capped) caches of parsed pictures and original frames. Measured: about
+/// 1 GB of private memory per worker on the 5-minute Amazon clip.
+pub const REPAIR_PEAK_CORR: f64 = 1.5e9;
 /// Budget per verify worker (measured peak ~235 MB).
 pub const VERIFY_PEAK: f64 = 0.5e9;
 
@@ -121,6 +123,30 @@ pub fn peak_rss() -> u64 {
                 Some(l.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
             })
             .unwrap_or(0)
+    }
+}
+
+/// Peak private (committed, not file-backed) memory of this process: unlike
+/// [`peak_rss`] it leaves out the pages of memory-mapped input streams. Falls
+/// back to [`peak_rss`] where there is no such figure.
+pub fn peak_private() -> u64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: PROCESS_MEMORY_COUNTERS is plain data; cb is set as the API requires.
+        unsafe {
+            let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+                return c.PeakPagefileUsage as u64;
+            }
+        }
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        peak_rss()
     }
 }
 

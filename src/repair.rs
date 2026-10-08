@@ -21,6 +21,7 @@
 //! the parsed pictures' slices; results are collected in task (period) order,
 //! so the output does not depend on the worker count or on completion order.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -40,10 +41,10 @@ use crate::explicit::Sigma;
 use crate::h264hdr::{Picture, Ppss, SliceType, Sps, Spss};
 use crate::mv::{Motion, derive_motion};
 use crate::patch::{
-    LruStore, MapStore, Nal, PARSED_CAP, ParsedPic, ParsedStore, PatchCache, PatchCtx, PatchResult, PatchStats, Targets, patch_pictures,
+    LruStore, MapStore, Nal, PARSED_CAP, ParsedPic, ParsedStore, PicRef, PatchCache, PatchCtx, PatchResult, PatchStats, Targets, patch_pictures,
     pcm_mb, pcm_record, qp_chain, write_segment,
 };
-use crate::recon::{Correction, Frame, add_residual, correct, predict_mb, residual};
+use crate::recon::{BlockMotion, Correction, Frame, add_residual, correct, predict_mb, predict_mb_with, residual};
 use crate::records::Mb;
 use crate::picture::{Parsed, decode_picture};
 use crate::stream::{new_lists, period_ranges};
@@ -74,6 +75,18 @@ pub const DRIFT_BUDGET: f64 = 1.0;
 pub const POOL_PASSES: usize = 2;
 /// A re-run is only worth it for at least this many more bytes per period.
 const POOL_MIN_SHARE: f64 = 4096.0;
+/// With corrections: parsed pictures kept per task, the first of them for
+/// good (see [`LruStore::pinned`]). A parsed 1080p picture holds about 11 MB
+/// of records and 2.6 MB of motion.
+const PARSED_CAP_CORR: usize = 24;
+const PARSED_PINNED_CORR: usize = 16;
+/// Parsed original pictures kept per task (corrections, and B pictures that
+/// keep their original motion).
+const ORIG_PARSED_CAP: usize = 24;
+const ORIG_PARSED_PINNED: usize = 16;
+/// The original frames of a task are decoded once and kept when the task
+/// has at most this many original pictures (3.1 MB each at 1080p).
+const ORIG_FRAMES_CAP: usize = 64;
 /// With corrections a round is cheap, and a long period with heavy drift
 /// needs more of them to settle.
 pub const DRIFT_MAX_ROUNDS_CORR: usize = 20;
@@ -459,6 +472,9 @@ struct TaskResult {
     budget: (usize, i64, bool),
     /// Measured repair: the bytes this period was allowed to add.
     allowed: f64,
+    /// Measured repair: stopped when the budget ran out, to be run again with
+    /// a share of the pooled budget (no output).
+    stopped: bool,
 }
 
 /// A 128-bit hash of a frame (the seen-frame cache of the measured repair
@@ -485,18 +501,42 @@ fn frame_key(data: &[u8]) -> (u64, u64) {
     ((m as u64) ^ a, ((m >> 64) as u64) ^ b)
 }
 
+/// (original decode index, frame) pairs.
+type Frames = [(usize, Vec<u8>)];
+
 /// (original dec, frame) of the original pictures of `periods`, in (period,
-/// POC) order, decoding one period at a time (Python `_orig_frames`).
+/// POC) order, decoding one period at a time (Python `_orig_frames`), or
+/// from the frames a previous round kept (`kept`). With `fill`, the decoded
+/// frames are also collected there.
 struct OrigFrames<'a> {
     cx: &'a Ctx<'a>,
     periods: &'a [usize],
     next_period: usize,
     cur: Option<(FrameIter, Vec<usize>, usize)>,
     fs: usize,
+    kept: Option<(&'a Frames, usize)>,
+    fill: Option<Vec<(usize, Vec<u8>)>>,
 }
 
-impl OrigFrames<'_> {
+impl<'a> OrigFrames<'a> {
+    fn new(cx: &'a Ctx<'a>, periods: &'a [usize], fs: usize, kept: Option<&'a Frames>, fill: bool) -> Self {
+        OrigFrames { cx, periods, next_period: 0, cur: None, fs, kept: kept.map(|k| (k, 0)), fill: (fill && kept.is_none()).then(Vec::new) }
+    }
+
     fn next(&mut self) -> Result<Option<(usize, Vec<u8>)>> {
+        if let Some((k, pos)) = &mut self.kept {
+            let r = k.get(*pos).map(|(d, f)| (*d, f.clone()));
+            *pos += 1;
+            return Ok(r);
+        }
+        let r = self.decode()?;
+        if let (Some(fill), Some((d, f))) = (&mut self.fill, &r) {
+            fill.push((*d, f.clone()));
+        }
+        Ok(r)
+    }
+
+    fn decode(&mut self) -> Result<Option<(usize, Vec<u8>)>> {
         loop {
             if self.cur.is_none() {
                 let Some(&g) = self.periods.get(self.next_period) else {
@@ -533,31 +573,45 @@ impl OrigFrames<'_> {
     }
 }
 
+/// Parsed original pictures with their original motion, kept across the
+/// rounds of a measured repair (shared by the corrections and by the B
+/// pictures that keep their original motion).
+type OrigParsed<'a> = RefCell<LruStore<'a>>;
+
+fn orig_parsed<'a>() -> OrigParsed<'a> {
+    RefCell::new(LruStore::new(ORIG_PARSED_CAP, [], |_| bail!("no reload")).pinned(ORIG_PARSED_PINNED))
+}
+
 /// The records of original picture `d` and its motion in the original
 /// context (Python `run_task_explicit.orig_motion`).
-fn orig_motion(cx: &Ctx, d: usize) -> Result<(Parsed, Motion)> {
+fn orig_motion(cx: &Ctx, oc: &OrigParsed, d: usize) -> Result<PicRef> {
+    if let Some(v) = oc.borrow_mut().get(d)? {
+        return Ok(v);
+    }
     let sps = cx.sps()?;
     let po = &cx.pics[d];
     let dd = decode_picture(cx.orig_es, cx.spss, cx.ppss, po)?;
     let col = if po.typ() == SliceType::B {
-        Some(orig_motion(cx, *po.lists[1].first().ok_or_else(|| anyhow!("list index out of range"))?)?.1)
+        Some(orig_motion(cx, oc, *po.lists[1].first().ok_or_else(|| anyhow!("list index out of range"))?)?.motion.clone())
     } else {
         None
     };
-    let m = derive_motion(po, &dd.mbs, sps.mb_w, sps.mb_h, cx.pics, col.as_ref()).with_context(|| format!("dec {d}"))?;
-    Ok((dd, m))
+    let m = derive_motion(po, &dd.mbs, sps.mb_w, sps.mb_h, cx.pics, col.as_deref()).with_context(|| format!("dec {d}"))?;
+    let v = Arc::new(ParsedPic { dd, motion: Arc::new(m) });
+    oc.borrow_mut().put(d, v.clone());
+    Ok(v)
 }
 
 /// Records of B picture `nd` of the new stream under its new header, with the
 /// motion it had in the original (its co-located picture there was D).
-fn keep_original_motion(cx: &Ctx, nd: usize) -> Result<ParsedPic> {
-    let (dd, mo) = orig_motion(cx, cx.orig_of_new[nd])?;
+fn keep_original_motion(cx: &Ctx, oc: &OrigParsed, nd: usize) -> Result<ParsedPic> {
+    let o = orig_motion(cx, oc, cx.orig_of_new[nd])?;
     let ns = &cx.new_pics[nd].slices[0];
     let nal = &cx.new_es[ns.offset..ns.offset + ns.size];
     let mut head = crate::bits::unescape(&nal[1..]);
     head.truncate(ns.data_bit / 8);
-    let parsed = Parsed { nal_header: nal[0], nal_len: nal.len(), sl: ns.clone(), head, mbs: dd.mbs, end_bit: dd.end_bit };
-    Ok(ParsedPic { dd: parsed, motion: Arc::new(mo) })
+    let parsed = Parsed { nal_header: nal[0], nal_len: nal.len(), sl: ns.clone(), head, mbs: o.dd.mbs.clone(), end_bit: o.dd.end_bit };
+    Ok(ParsedPic { dd: parsed, motion: o.motion.clone() })
 }
 
 /// A repaired macroblock of the measured repair.
@@ -684,26 +738,19 @@ fn put_mb(dst: &mut [u8], s: &[u8; 384], mb_w: usize, x: usize, y: usize) {
     }
 }
 
-/// Motion `m` with its reference pictures looked up in `lists` (decode
-/// indices of another stream with the same reference indices).
-fn remap_refs(m: &Motion, lists: &[Vec<usize>; 2]) -> Result<Motion> {
-    let mut n = m.clone();
-    for l in 0..2 {
-        for i in 0..n.refidx[l].len() {
-            let r = n.refidx[l][i];
-            n.refpic[l][i] = if r >= 0 {
-                let p = *lists[l].get(r as usize).ok_or_else(|| anyhow!("reference index {r} outside list {l}"))?;
-                if p == NONE {
-                    bail!("reference index {r} of list {l} names a dropped picture without substitute");
-                }
-                p as i32
-            } else {
-                -1
-            };
-        }
-    }
-    Ok(n)
+/// What the corrections need of an original macroblock, kept across rounds
+/// (parsing a picture and deriving its motion again every round cost more
+/// than the corrections themselves): its record and QP, the motion of its
+/// 4x4 blocks (references as original decode indices) and its
+/// pre-deblocking reconstruction. `None` for intra MBs.
+struct OrigMb {
+    mb: Box<Mb>,
+    qp: i32,
+    pps_id: u32,
+    motion: [BlockMotion; 16],
+    pre: Box<[u8; 384]>,
 }
+type OrigCache = HashMap<(usize, u16, u16), Option<OrigMb>>;
 
 /// Corrections for the inter macroblocks `mbs` of picture `nd` of the new
 /// stream: the original's pre-deblocking reconstruction is the target, the
@@ -722,14 +769,37 @@ fn corrections(
     mbs: &[((u16, u16), Box<[u8; 384]>, Box<[u8; 384]>)],
     refs: &RefFrames,
     fixes: &HashMap<(usize, u16, u16), Fix>,
+    cache: &mut OrigCache,
+    oc: &OrigParsed,
 ) -> Result<HashMap<(u16, u16), Correction>> {
     let sps = cx.sps()?;
     let d = cx.orig_of_new[nd];
-    let (dd, mo) = orig_motion(cx, d)?;
-    let pps = cx.ppss.get(&dd.sl.pps_id).ok_or_else(|| anyhow!("KeyError: pps {}", dd.sl.pps_id))?;
-    let mn = remap_refs(&mo, &cx.new_pics[nd].lists)?;
-    let qps = qp_chain(&dd.mbs, dd.sl.qp);
     let orig_ref = |r: usize| refs.frames[1].get(&r).map(|f| Frame::new(f, sps));
+    if mbs.iter().any(|((x, y), _, _)| !cache.contains_key(&(nd, *x, *y))) {
+        let o = orig_motion(cx, oc, d)?;
+        let (dd, mo) = (&o.dd, &*o.motion);
+        let pps = cx.ppss.get(&dd.sl.pps_id).ok_or_else(|| anyhow!("KeyError: pps {}", dd.sl.pps_id))?;
+        let qps = qp_chain(&dd.mbs, dd.sl.qp);
+        for ((x, y), _, _) in mbs {
+            let (x, y) = (*x, *y);
+            if cache.contains_key(&(nd, x, y)) {
+                continue;
+            }
+            let i = y as usize * sps.mb_w + x as usize;
+            let orig = &dd.mbs[i];
+            if orig.intra {
+                cache.insert((nd, x, y), None);
+                continue;
+            }
+            let opred = predict_mb(pps, &cx.pics[d], cx.pics, mo, x as usize, y as usize, &orig_ref)?;
+            let pre = add_residual(&opred, &residual(orig, qps[i], pps)?);
+            let motion: [BlockMotion; 16] = std::array::from_fn(|k| {
+                let j = mo.idx(x as usize * 4 + k % 4, y as usize * 4 + k / 4);
+                BlockMotion { refidx: [mo.refidx[0][j], mo.refidx[1][j]], refpic: [mo.refpic[0][j], mo.refpic[1][j]], mv: [mo.mv[0][j], mo.mv[1][j]] }
+            });
+            cache.insert((nd, x, y), Some(OrigMb { mb: Box::new(orig.clone()), qp: qps[i], pps_id: dd.sl.pps_id, motion, pre: Box::new(pre) }));
+        }
+    }
     let cur_ref = |r: usize| refs.frames[0].get(&r).map(|f| Frame::new(f, sps));
     // references with this round's fixes pasted in
     let mut predicted: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -745,22 +815,39 @@ fn corrections(
         }
     }
     let new_ref = |r: usize| predicted.get(&r).or_else(|| refs.frames[0].get(&r)).map(|f| Frame::new(f, sps));
+    let lists = &cx.new_pics[nd].lists;
     let mut out = HashMap::new();
     for ((x, y), now_s, orig_post) in mbs {
         let (x, y) = (*x, *y);
-        let i = y as usize * sps.mb_w + x as usize;
-        let orig = &dd.mbs[i];
-        if orig.intra {
+        let Some(om) = &cache[&(nd, x, y)] else {
             continue;
-        }
+        };
+        let pps = cx.ppss.get(&om.pps_id).ok_or_else(|| anyhow!("KeyError: pps {}", om.pps_id))?;
         let (base, bqp) = match fixes.get(&(nd, x, y)) {
             Some(Fix::Corr(m, _, _, q)) => (&**m, *q),
             Some(Fix::Pcm(_)) => continue,
-            None => (orig, qps[i]),
+            None => (&*om.mb, om.qp),
         };
-        let opred = predict_mb(pps, &cx.pics[d], cx.pics, &mo, x as usize, y as usize, &orig_ref)?;
-        let pre_orig = add_residual(&opred, &residual(orig, qps[i], pps)?);
-        let cpred = predict_mb(pps, &cx.new_pics[nd], cx.new_pics, &mn, x as usize, y as usize, &cur_ref)?;
+        // the original motion with its references looked up in the new lists
+        let (x0, y0) = (x as usize * 4, y as usize * 4);
+        let at = |gx: usize, gy: usize| -> Result<BlockMotion> {
+            let mut b = om.motion[(gy - y0) * 4 + (gx - x0)];
+            for l in 0..2 {
+                let r = b.refidx[l];
+                b.refpic[l] = if r >= 0 {
+                    let p = *lists[l].get(r as usize).ok_or_else(|| anyhow!("reference index {r} outside list {l}"))?;
+                    if p == NONE {
+                        bail!("reference index {r} of list {l} names a dropped picture without substitute");
+                    }
+                    p as i32
+                } else {
+                    -1
+                };
+            }
+            Ok(b)
+        };
+        let pre_orig = &*om.pre;
+        let cpred = predict_mb_with(pps, &cx.new_pics[nd], cx.new_pics, &at, x as usize, y as usize, &cur_ref)?;
         let pre_now = add_residual(&cpred, &residual(base, bqp, pps)?);
         // deblocking moved the original by orig_post - pre_orig and moves the
         // current decode by now - pre_now: aim off by the difference
@@ -768,7 +855,7 @@ fn corrections(
             let deb = (orig_post[k] as i32 - pre_orig[k] as i32) - (now_s[k] as i32 - pre_now[k] as i32);
             (pre_orig[k] as i32 + deb).clamp(0, 255) as u8
         });
-        let npred = predict_mb(pps, &cx.new_pics[nd], cx.new_pics, &mn, x as usize, y as usize, &new_ref)?;
+        let npred = predict_mb_with(pps, &cx.new_pics[nd], cx.new_pics, &at, x as usize, y as usize, &new_ref)?;
         let c = correct(base, bqp, pps, &npred, &target, corr_max_err(&cx.drift)).with_context(|| format!("picture {nd} MB ({x}, {y})"))?;
         if std::env::var_os("FD_CORR_DEBUG").is_some() {
             let pre = npred.iter().zip(&target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
@@ -800,8 +887,10 @@ fn corrections(
 /// parsed pictures live in an LRU.
 ///
 /// `allowed` overrides the period's byte budget (a re-run with a share of the
-/// pooled budget).
-fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<TaskResult> {
+/// pooled budget). With `stop`, a period that runs out of budget stops at
+/// once (it will be run again with more) instead of going on with I_PCM
+/// only.
+fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>, stop: bool) -> Result<TaskResult> {
     let t0 = Instant::now();
     let sigma = cx.sigma.ok_or_else(|| anyhow!("explicit repair needs sigma"))?;
     let sps = cx.sps()?;
@@ -829,7 +918,12 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
             o.typ() == SliceType::B && o.lists[1].first().is_some_and(|c| sigma.get(c).is_some_and(|v| v.is_some()))
         })
         .collect();
-    let mut store = LruStore::new(PARSED_CAP, force.iter().copied(), |nd| keep_original_motion(cx, nd));
+    let ocache = orig_parsed();
+    let mut store = if use_corr {
+        LruStore::new(PARSED_CAP_CORR, force.iter().copied(), |nd| keep_original_motion(cx, &ocache, nd)).pinned(PARSED_PINNED_CORR)
+    } else {
+        LruStore::new(PARSED_CAP, force.iter().copied(), |nd| keep_original_motion(cx, &ocache, nd))
+    };
 
     let mut order: Vec<usize> = new_range.clone().collect();
     order.sort_by_key(|&nd| new_pics[nd].poc); // stable, like sorted(key=poc)
@@ -842,6 +936,10 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
     let mut fixes: HashMap<(usize, u16, u16), Fix> = HashMap::new();
     let mut version = 0u64;
     let mut cache = PatchCache::default();
+    let mut orig_cache = OrigCache::new();
+    // the original frames, decoded once if the task is short enough
+    let keep_orig = task.orig_periods.iter().map(|&g| cx.orig_ranges[g].len()).sum::<usize>() <= ORIG_FRAMES_CAP;
+    let mut orig_frames: Option<Vec<(usize, Vec<u8>)>> = None;
     let mut seen: HashMap<usize, ((u64, u64), Vec<u8>)> = HashMap::new();
     let mut capped: BTreeSet<usize> = BTreeSet::new();
     let mut worst: HashMap<usize, u8> = HashMap::new();
@@ -860,6 +958,21 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
         spent = res.stats.values().map(|s| s.bytes_after as i64 - s.bytes_before as i64).sum();
         if use_corr && cx.drift.budget > 0.0 && spent as f64 > budget_bytes {
             over_budget = true;
+            if stop {
+                return Ok(TaskResult {
+                    period: task.period,
+                    repl: BTreeMap::new(),
+                    stats: BTreeMap::new(),
+                    sniff: Vec::new(),
+                    rounds: Some(rounds),
+                    patches: BTreeMap::new(),
+                    seconds: round1(t0.elapsed().as_secs_f64()),
+                    pcm_why,
+                    budget: (dropped_bytes, spent, true),
+                    allowed: budget_bytes,
+                    stopped: true,
+                });
+            }
         }
         // over budget: only what would otherwise get I_PCM
         let threshold = if over_budget { cx.drift.pcm_threshold.max(cx.drift.threshold) } else { cx.drift.threshold };
@@ -880,7 +993,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
         // made against references predicted after this round's fixes)
         let sequential = rounds < DRIFT_SEQUENTIAL_ROUNDS && !use_corr;
         let mut first_ref = usize::MAX;
-        let mut ogen = OrigFrames { cx, periods: &task.orig_periods, next_period: 0, cur: None, fs };
+        let mut ogen = OrigFrames::new(cx, &task.orig_periods, fs, orig_frames.as_deref(), keep_orig);
         let mut n_out = 0usize;
         {
             let size = std::fs::metadata(&tmp.0)?.len() as usize;
@@ -910,10 +1023,12 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
                     }
                 };
                 // a frame decoded exactly as in the previous round needs no new diff
-                let key = frame_key(&fr);
-                if seen.get(&nd).map(|s| s.0) != Some(key) {
-                    seen.insert(nd, (key, visible_maxdiff(&fr, &ofr, sps)));
-                }
+                {
+                    let key = frame_key(&fr);
+                    if seen.get(&nd).map(|s| s.0) != Some(key) {
+                        seen.insert(nd, (key, visible_maxdiff(&fr, &ofr, sps)));
+                    }
+                };
                 let m = &seen[&nd].1;
                 let mut bad: Vec<(u8, u16, u16)> = Vec::new();
                 for (i, &v) in m.iter().enumerate() {
@@ -969,7 +1084,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
                         if refs.ready(cx, nd) {
                             let (nd, mbs) = pending.swap_remove(i);
                             if !sequential || nd <= first_ref {
-                                corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+                                corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes, &mut orig_cache, &ocache)?);
                             }
                             refs.release(cx, nd);
                         } else {
@@ -986,7 +1101,11 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
                 refs.offer(1, d, &f);
             }
         }
+        let filled = ogen.fill.take();
         drop(ogen);
+        if filled.is_some() {
+            orig_frames = filled;
+        }
         if n_out != order.len() {
             bail!("period {}: decoded {n_out} of {} pictures", task.period, order.len());
         }
@@ -995,7 +1114,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
                 bail!("period {}: reference frames of picture {nd} never arrived", task.period);
             }
             if !sequential || nd <= first_ref {
-                corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+                corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes, &mut orig_cache, &ocache)?);
             }
         }
         drop(refs);
@@ -1106,6 +1225,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<Task
         pcm_why,
         budget: (dropped_bytes, spent, over_budget),
         allowed: budget_bytes,
+        stopped: false,
     })
 }
 
@@ -1234,6 +1354,7 @@ fn run_task_exact(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         pcm_why: [0; 4],
         budget: (0, 0, false),
         allowed: 0.0,
+        stopped: false,
     })
 }
 
@@ -1268,6 +1389,12 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         log.log(&format!("repair: {} pictures with a changed reference context in {} IDR periods", c.len(), t.len()));
         (tasks, cands, orig_of_new, peak) = (t, c, oon, REPAIR_PEAK);
     }
+    // explicit mode: longest periods first, so that they do not run alone
+    // at the end (the time of a period grows with its length)
+    let mut tasks = tasks;
+    if explicit {
+        tasks.sort_by_key(|t| std::cmp::Reverse(t.new.len()));
+    }
     let mut new_of = vec![NONE; pics.len()];
     for (nd, &d) in orig_of_new.iter().enumerate() {
         new_of[d] = nd;
@@ -1296,6 +1423,17 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         };
         let progress = |n_tasks: usize| {
             move |i: usize, r: &TaskResult| {
+                if r.stopped {
+                    log.log(&format!(
+                        "  [{}/{}] IDR period {}: over budget after {} rounds, to be repaired again ({:.1} s)",
+                        i + 1,
+                        n_tasks,
+                        r.period,
+                        r.rounds.unwrap_or(0),
+                        r.seconds
+                    ));
+                    return;
+                }
                 let n_fixed: usize = r.patches.values().sum();
                 let n_corr: usize = r.stats.values().map(|s| s.corrected).sum();
                 let fixed = if n_corr > 0 { format!("{} PCM + {n_corr} corrected MBs", n_fixed - n_corr) } else { format!("{n_fixed} PCM MBs") };
@@ -1310,38 +1448,51 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
                 ));
             }
         };
-        let work = |t: &Task| if explicit { run_task_explicit(&cx, t, None) } else { run_task_exact(&cx, t) };
+        // the pooled budget: periods that run out stop and are repaired again
+        // with an equal share of what the others left (deterministic: the
+        // shares only depend on finished passes, not on worker scheduling);
+        // the last pass goes on with I_PCM only where its share runs out
+        let pooling = explicit && a.drift.corrections && a.drift.budget > 0.0;
+        let work = |t: &Task| if explicit { run_task_explicit(&cx, t, None, pooling) } else { run_task_exact(&cx, t) };
         results = run_pool(nproc, &tasks, &work, progress(tasks.len()))?;
-        // the pooled budget: periods that ran out are repaired again with an
-        // equal share of what is still unspent overall (deterministic: the
-        // shares only depend on finished passes, not on worker scheduling)
-        if explicit && a.drift.corrections && a.drift.budget > 0.0 {
+        if pooling {
             let total = a.drift.budget * results.iter().map(|r| r.budget.0).sum::<usize>() as f64;
             for pass in 1..=POOL_PASSES {
-                let spent: i64 = results.iter().map(|r| r.budget.1).sum();
                 let over: Vec<usize> = (0..results.len()).filter(|&i| results[i].budget.2).collect();
-                if over.is_empty() {
+                if !over.iter().any(|&i| results[i].stopped) {
                     break;
                 }
-                let share = (total - spent as f64) / over.len() as f64;
+                // what the finished periods spent, and what the stopped ones
+                // were allowed (their spending is redone)
+                let committed: f64 = results.iter().map(|r| if r.stopped { r.allowed } else { r.budget.1 as f64 }).sum();
+                let mut share = (total - committed) / over.len() as f64;
+                let mut last = pass == POOL_PASSES;
                 if share < POOL_MIN_SHARE {
-                    log.log(&format!("repair: {} periods over budget, {:.0} bytes left to share: no re-run", over.len(), total - spent as f64));
-                    break;
+                    share = 0.0;
+                    last = true;
                 }
+                // without a share only the stopped periods need a run (to the end)
+                let again_i: Vec<usize> = over.into_iter().filter(|&i| share > 0.0 || results[i].stopped).collect();
                 log.log(&format!(
-                    "repair: pooled budget pass {pass}: {} periods over budget get {:.0} more bytes each ({:+} of {:.0} spent)",
-                    over.len(),
+                    "repair: pooled budget pass {pass}: {} periods over budget get {:.0} more bytes each ({:.0} of {:.0} committed)",
+                    again_i.len(),
                     share,
-                    spent,
+                    committed,
                     total
                 ));
-                let again: Vec<(&Task, f64)> = over.iter().map(|&i| (&tasks[i], results[i].allowed + share)).collect();
+                let again: Vec<(&Task, f64)> = again_i.iter().map(|&i| (&tasks[i], results[i].allowed + share)).collect();
                 let n = pool_size(a.workers, peak, Some(again.len()));
-                let rerun = run_pool(n, &again, &|t: &(&Task, f64)| run_task_explicit(&cx, t.0, Some(t.1)), progress(again.len()))?;
-                for (i, r) in over.into_iter().zip(rerun) {
+                let rerun = run_pool(n, &again, &|t: &(&Task, f64)| run_task_explicit(&cx, t.0, Some(t.1), !last), progress(again.len()))?;
+                for (i, r) in again_i.into_iter().zip(rerun) {
                     results[i] = r;
                 }
                 pooled_passes = pass;
+                if last {
+                    break;
+                }
+            }
+            if let Some(r) = results.iter().find(|r| r.stopped) {
+                bail!("period {}: stopped over budget and never repaired", r.period);
             }
         }
     }

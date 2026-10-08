@@ -210,6 +210,9 @@ struct Resources {
     physical_ram_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     main_peak_rss_mb: Option<u64>,
+    /// Peak private memory (without the pages of the memory-mapped streams).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_peak_private_mb: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -406,6 +409,7 @@ impl Run {
                 cpu_count: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
                 physical_ram_gb: py_round(total as f64 / (1u64 << 30) as f64, 1),
                 main_peak_rss_mb: None,
+                main_peak_private_mb: None,
             },
             input_rate: None,
             frames_in: None,
@@ -1112,8 +1116,10 @@ pub fn run(mut args: Args) -> i32 {
     r.rep.runtime_s = Some(Pairs(times));
     let peak = (system::peak_rss() as f64 / (1u64 << 20) as f64).round_ties_even() as u64;
     r.rep.resources.main_peak_rss_mb = Some(peak);
+    let private = (system::peak_private() as f64 / (1u64 << 20) as f64).round() as u64;
+    r.rep.resources.main_peak_private_mb = Some(private);
     r.log(&format!(
-        "done: status {}, main process peak RSS {peak} MB, total {} s",
+        "done: status {}, main process peak RSS {peak} MB (private {private} MB), total {} s",
         r.rep.status.unwrap_or("None"),
         pyf(total_s)
     ));

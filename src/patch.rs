@@ -265,17 +265,30 @@ impl ParsedStore for MapStore {
 /// their original motion) are recomputed by `reload` when evicted; anything
 /// else evicted is simply parsed again by `patch_pictures`. Python
 /// `repair._ParsedLRU`.
+///
+/// With [`LruStore::pinned`], the first pictures stored are never evicted:
+/// a measured repair walks its whole period every round, and plain LRU over
+/// a cycle longer than `cap` evicts every picture before it is needed again.
 pub struct LruStore<'a> {
     cap: usize,
+    pin_cap: usize,
     clock: u64,
-    map: HashMap<usize, (u64, PicRef)>,
+    /// (last use, pinned, picture)
+    map: HashMap<usize, (u64, bool, PicRef)>,
     reload_keys: HashSet<usize>,
     reload: Box<dyn FnMut(usize) -> Result<ParsedPic> + 'a>,
 }
 
 impl<'a> LruStore<'a> {
     pub fn new(cap: usize, reload_keys: impl IntoIterator<Item = usize>, reload: impl FnMut(usize) -> Result<ParsedPic> + 'a) -> Self {
-        LruStore { cap, clock: 0, map: HashMap::new(), reload_keys: reload_keys.into_iter().collect(), reload: Box::new(reload) }
+        LruStore { cap, pin_cap: 0, clock: 0, map: HashMap::new(), reload_keys: reload_keys.into_iter().collect(), reload: Box::new(reload) }
+    }
+
+    /// Never evict the first `n` pictures stored (`n` < `cap`; the rest of
+    /// the capacity stays LRU).
+    pub fn pinned(mut self, n: usize) -> Self {
+        self.pin_cap = n.min(self.cap.saturating_sub(1));
+        self
     }
 
     /// Number of stored pictures.
@@ -290,7 +303,7 @@ impl<'a> LruStore<'a> {
 
 impl ParsedStore for LruStore<'_> {
     fn get(&mut self, dec: usize) -> Result<Option<PicRef>> {
-        if let Some((stamp, v)) = self.map.get_mut(&dec) {
+        if let Some((stamp, _, v)) = self.map.get_mut(&dec) {
             self.clock += 1;
             *stamp = self.clock;
             return Ok(Some(v.clone()));
@@ -305,9 +318,13 @@ impl ParsedStore for LruStore<'_> {
 
     fn put(&mut self, dec: usize, v: PicRef) {
         self.clock += 1;
-        self.map.insert(dec, (self.clock, v));
+        let pin = match self.map.get(&dec) {
+            Some(e) => e.1,
+            None => self.map.values().filter(|e| e.1).count() < self.pin_cap,
+        };
+        self.map.insert(dec, (self.clock, pin, v));
         while self.map.len() > self.cap {
-            let oldest = *self.map.iter().min_by_key(|(_, (stamp, _))| *stamp).map(|(k, _)| k).expect("non-empty");
+            let oldest = *self.map.iter().filter(|(_, e)| !e.1).min_by_key(|(_, e)| e.0).map(|(k, _)| k).expect("an unpinned entry");
             self.map.remove(&oldest);
         }
     }
