@@ -103,6 +103,10 @@ pub struct Args {
     /// with corrections, 0.02 without)
     #[arg(long, hide = true)]
     pub drift_cap: Option<f64>,
+    /// anchor rebuild with corrections: I_PCM for leading B macroblocks off
+    /// by this much or more that no correction fixes (default 8)
+    #[arg(long, hide = true)]
+    pub rebuild_pcm_threshold: Option<u32>,
 
     /// use explicit reference control (and the measured repair) even when
     /// the stream does not need it
@@ -745,7 +749,7 @@ impl Run {
             let rb_es = self.work.join("rebuilt.h264");
             let (o, rb) = rebuild::rebuild(
                 &ld.es, &out_es, &rb_es, &nspss, &nppss, &ld.pics, &src_pics, &src_orig, &rbs, self.workers, &self.work, &self.log,
-                if self.a.no_corrections { None } else { Some(rebuild::CORR_THRESHOLD) },
+                if self.a.no_corrections { None } else { Some((rebuild::CORR_THRESHOLD, self.a.rebuild_pcm_threshold.unwrap_or(rebuild::PCM_THRESHOLD_CORR))) },
             )?;
             orig_of_out = o;
             self.log(&format!(

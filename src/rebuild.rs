@@ -59,8 +59,12 @@ pub const MAX_ROUNDS_CORR: usize = 8;
 /// With corrections (the default), B1-B3 macroblocks off by this much or more
 /// get residual corrections.
 pub const CORR_THRESHOLD: u8 = 8;
+/// With corrections, B1-B3 macroblocks off by this much or more that no
+/// correction fixes get I_PCM ([`PCM_THRESHOLD`] without corrections). They
+/// are not references, so an I_PCM costs nothing downstream.
+pub const PCM_THRESHOLD_CORR: u32 = 8;
 /// With corrections, a correction is retried this often before an MB over
-/// [`PCM_THRESHOLD`] gets I_PCM.
+/// the I_PCM threshold gets I_PCM.
 const CORR_MAX_TRIES: u8 = 3;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
@@ -86,8 +90,10 @@ struct Ctx<'a> {
     orig_of_src: &'a [usize],
     rebuilds: &'a [Rebuild],
     work: &'a Path,
-    /// Residual corrections for MBs off by this much or more (None: I_PCM only).
-    corr: Option<u8>,
+    /// Residual corrections for MBs off by the first value or more, I_PCM
+    /// for those no correction fixes from the second on (None: I_PCM only,
+    /// from [`PCM_THRESHOLD`]).
+    corr: Option<(u8, u32)>,
 }
 
 /// Statistics of one leading picture (Python's `stats[b]` dict).
@@ -204,7 +210,7 @@ struct CorrFix {
 /// plus the difference in what deblocking does to it in the original and in
 /// the current decode; the prediction is the same motion over the rebuilt
 /// stream, where I2 stands in K's slot. I_PCM is left for MBs over
-/// [`PCM_THRESHOLD`] that no correction fixes.
+/// the I_PCM threshold that no correction fixes.
 fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
     let t0 = Instant::now();
     let sps = cx.spss.get(&0).ok_or_else(|| anyhow!("KeyError: 0 (no SPS with id 0)"))?;
@@ -265,6 +271,7 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
     // with corrections, I_PCM is only for what no correction fixes: no cap
     // (B1-B3 are not references; a picture that needs it is rare)
     let budget = if cx.corr.is_some() { w * h } else { (PCM_MAX_FRACTION * w as f64 * h as f64) as usize };
+    let pcm_thr = cx.corr.map_or(PCM_THRESHOLD, |c| c.1);
     let seg = &src[task.seg.clone()];
     let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
     let max_rounds = if cx.corr.is_some() { MAX_ROUNDS_CORR } else { MAX_ROUNDS };
@@ -313,12 +320,12 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
         for (i, &b) in bs.iter().enumerate() {
             let (m, ly) = mb_maxdiff(&got[&b], target[i], w, h);
             let mut fresh: HashSet<(u16, u16)> = HashSet::new();
-            if let (Some(thr), false) = (cx.corr, last) {
+            if let (Some((thr, _)), false) = (cx.corr, last) {
                 let (dd, base, m0) = &recs[i];
                 let mut cands: Vec<(u8, u16, u16)> = Vec::new();
                 for (j, &v) in m.iter().enumerate() {
                     let (x, y) = ((j % w) as u16, (j / w) as u16);
-                    let keep_settled = settled[i].contains(&(x, y)) && (v as u32) < PCM_THRESHOLD;
+                    let keep_settled = settled[i].contains(&(x, y)) && (v as u32) < pcm_thr;
                     if v >= thr && !pcm[i].contains(&(x, y)) && !keep_settled && !dd.mbs[j].intra {
                         cands.push((v, x, y));
                     }
@@ -358,7 +365,7 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
                             corr[i].insert((x, y), CorrFix { mb: c.mb, qp: c.qp, tries: tries + 1 });
                             fresh.insert((x, y));
                             grew = true;
-                        } else if (v as u32) < PCM_THRESHOLD {
+                        } else if (v as u32) < pcm_thr {
                             settled[i].insert((x, y));
                         }
                     }
@@ -373,7 +380,7 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
             st.rounds = rnd + 1;
             let mut more: Vec<(u8, u16, u16)> = Vec::new();
             for (j, &v) in m.iter().enumerate() {
-                if v as u32 >= PCM_THRESHOLD {
+                if v as u32 >= pcm_thr {
                     let (x, y) = ((j % w) as u16, (j / w) as u16);
                     // with corrections, I_PCM only where no correction was
                     // made this round
@@ -420,7 +427,7 @@ pub fn rebuild(
     workers: usize,
     work: &Path,
     log: &crate::system::Logger,
-    corr: Option<u8>,
+    corr: Option<(u8, u32)>,
 ) -> Result<(Vec<usize>, serde_json::Value)> {
     let t0 = Instant::now();
     let chk = check_lists(spss, src_pics, 0, rebuilds)?;
@@ -510,12 +517,12 @@ pub fn rebuild(
     let sps = spss.get(&0).ok_or_else(|| anyhow!("KeyError: 0 (no SPS with id 0)"))?;
     let summary = serde_json::json!({
         "pairs": pairs.len(), "leading_b_pictures": n_leading,
-        "pcm_threshold": PCM_THRESHOLD,
+        "pcm_threshold": corr.map_or(PCM_THRESHOLD, |c| c.1),
         "pcm_max_per_picture": if corr.is_some() { sps.mb_w * sps.mb_h } else { (PCM_MAX_FRACTION * sps.mb_w as f64 * sps.mb_h as f64) as usize },
         "pictures_pcm_capped": n_capped_pairs, "pcm_mbs": pcm_total, "direct_explicit": direct_total,
         "bytes_added": bytes_total, "worst_in_leading_b": worst, "workers": nproc,
         "corrected_mbs": results.iter().flat_map(|r| &r.stats).map(|s| s.corrected).sum::<usize>(),
-        "corr_threshold": corr,
+        "corr_threshold": corr.map(|c| c.0),
         "worker_peak_rss_mb": (crate::system::peak_rss() as f64 / (1u64 << 20) as f64).round() as u64,
         "seconds": round1(t0.elapsed().as_secs_f64()), "pairs_detail": pairs,
     });

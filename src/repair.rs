@@ -65,8 +65,15 @@ pub const DRIFT_MAX_ROUNDS: usize = 12;
 pub const DRIFT_THRESHOLD_CORR: u8 = 6;
 /// ... and those no correction fixes get I_PCM from this much on.
 pub const PCM_THRESHOLD_CORR: u8 = 8;
-/// Per-period byte budget, as a fraction of the bytes dropped from it.
+/// Byte budget, as a fraction of the bytes dropped. Each period starts with
+/// this share of its own dropped bytes; periods that run out are repaired
+/// again with what the others left unspent ([`POOL_PASSES`]).
 pub const DRIFT_BUDGET: f64 = 1.0;
+/// Re-runs of the periods that ran out of budget, each with an equal share
+/// of the bytes still unspent overall.
+pub const POOL_PASSES: usize = 2;
+/// A re-run is only worth it for at least this many more bytes per period.
+const POOL_MIN_SHARE: f64 = 4096.0;
 /// With corrections a round is cheap, and a long period with heavy drift
 /// needs more of them to settle.
 pub const DRIFT_MAX_ROUNDS_CORR: usize = 20;
@@ -87,7 +94,8 @@ pub struct Drift {
     pub pcm_threshold: u8,
     /// With corrections: a period that has added more than this times the
     /// bytes of the pictures dropped from it only repairs MBs from
-    /// `pcm_threshold` on (0: no limit).
+    /// `pcm_threshold` on (0: no limit). What periods leave unspent is
+    /// shared by those that ran out.
     pub budget: f64,
 }
 
@@ -449,6 +457,8 @@ struct TaskResult {
     /// Measured repair: (bytes of the dropped pictures, bytes added, whether
     /// the budget ran out).
     budget: (usize, i64, bool),
+    /// Measured repair: the bytes this period was allowed to add.
+    allowed: f64,
 }
 
 /// A 128-bit hash of a frame (the seen-frame cache of the measured repair
@@ -788,7 +798,10 @@ fn corrections(
 /// original is decoded again in lockstep every round, only the target frames
 /// of patched pictures and the reference frames still needed are kept, and
 /// parsed pictures live in an LRU.
-fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
+///
+/// `allowed` overrides the period's byte budget (a re-run with a share of the
+/// pooled budget).
+fn run_task_explicit(cx: &Ctx, task: &Task, allowed: Option<f64>) -> Result<TaskResult> {
     let t0 = Instant::now();
     let sigma = cx.sigma.ok_or_else(|| anyhow!("explicit repair needs sigma"))?;
     let sps = cx.sps()?;
@@ -805,7 +818,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         .filter(|&d| cx.new_of[d] == NONE)
         .map(|d| pics[d].slices.iter().map(|s| s.size).sum::<usize>())
         .sum();
-    let budget_bytes = cx.drift.budget * dropped_bytes as f64;
+    let budget_bytes = allowed.unwrap_or(cx.drift.budget * dropped_bytes as f64);
     let mut spent;
     let mut over_budget = false;
 
@@ -1092,6 +1105,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         seconds: round1(t0.elapsed().as_secs_f64()),
         pcm_why,
         budget: (dropped_bytes, spent, over_budget),
+        allowed: budget_bytes,
     })
 }
 
@@ -1219,6 +1233,7 @@ fn run_task_exact(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         seconds: round1(t0.elapsed().as_secs_f64()),
         pcm_why: [0; 4],
         budget: (0, 0, false),
+        allowed: 0.0,
     })
 }
 
@@ -1259,6 +1274,7 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
     }
     let nproc = if tasks.is_empty() { 0 } else { pool_size(a.workers, peak, Some(tasks.len())) };
     let mut results: Vec<TaskResult> = Vec::new();
+    let mut pooled_passes = 0usize;
     if !tasks.is_empty() {
         log.log(&format!("repair: {nproc} workers"));
         let orig_map = map_file(a.orig_es)?;
@@ -1278,22 +1294,56 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
             orig_ranges: period_ranges(pics),
             drift: a.drift,
         };
-        let n_tasks = tasks.len();
-        let work = |t: &Task| if explicit { run_task_explicit(&cx, t) } else { run_task_exact(&cx, t) };
-        results = run_pool(nproc, &tasks, &work, |i, r: &TaskResult| {
-            let n_fixed: usize = r.patches.values().sum();
-            let n_corr: usize = r.stats.values().map(|s| s.corrected).sum();
-            let fixed = if n_corr > 0 { format!("{} PCM + {n_corr} corrected MBs", n_fixed - n_corr) } else { format!("{n_fixed} PCM MBs") };
-            let rounds = r.rounds.map(|n| format!(", {n} rounds")).unwrap_or_default();
-            log.log(&format!(
-                "  [{}/{}] IDR period {}: {} pictures rewritten, {fixed} ({:.1} s{rounds})",
-                i + 1,
-                n_tasks,
-                r.period,
-                r.repl.len(),
-                r.seconds
-            ));
-        })?;
+        let progress = |n_tasks: usize| {
+            move |i: usize, r: &TaskResult| {
+                let n_fixed: usize = r.patches.values().sum();
+                let n_corr: usize = r.stats.values().map(|s| s.corrected).sum();
+                let fixed = if n_corr > 0 { format!("{} PCM + {n_corr} corrected MBs", n_fixed - n_corr) } else { format!("{n_fixed} PCM MBs") };
+                let rounds = r.rounds.map(|n| format!(", {n} rounds")).unwrap_or_default();
+                log.log(&format!(
+                    "  [{}/{}] IDR period {}: {} pictures rewritten, {fixed} ({:.1} s{rounds})",
+                    i + 1,
+                    n_tasks,
+                    r.period,
+                    r.repl.len(),
+                    r.seconds
+                ));
+            }
+        };
+        let work = |t: &Task| if explicit { run_task_explicit(&cx, t, None) } else { run_task_exact(&cx, t) };
+        results = run_pool(nproc, &tasks, &work, progress(tasks.len()))?;
+        // the pooled budget: periods that ran out are repaired again with an
+        // equal share of what is still unspent overall (deterministic: the
+        // shares only depend on finished passes, not on worker scheduling)
+        if explicit && a.drift.corrections && a.drift.budget > 0.0 {
+            let total = a.drift.budget * results.iter().map(|r| r.budget.0).sum::<usize>() as f64;
+            for pass in 1..=POOL_PASSES {
+                let spent: i64 = results.iter().map(|r| r.budget.1).sum();
+                let over: Vec<usize> = (0..results.len()).filter(|&i| results[i].budget.2).collect();
+                if over.is_empty() {
+                    break;
+                }
+                let share = (total - spent as f64) / over.len() as f64;
+                if share < POOL_MIN_SHARE {
+                    log.log(&format!("repair: {} periods over budget, {:.0} bytes left to share: no re-run", over.len(), total - spent as f64));
+                    break;
+                }
+                log.log(&format!(
+                    "repair: pooled budget pass {pass}: {} periods over budget get {:.0} more bytes each ({:+} of {:.0} spent)",
+                    over.len(),
+                    share,
+                    spent,
+                    total
+                ));
+                let again: Vec<(&Task, f64)> = over.iter().map(|&i| (&tasks[i], results[i].allowed + share)).collect();
+                let n = pool_size(a.workers, peak, Some(again.len()));
+                let rerun = run_pool(n, &again, &|t: &(&Task, f64)| run_task_explicit(&cx, t.0, Some(t.1)), progress(again.len()))?;
+                for (i, r) in over.into_iter().zip(rerun) {
+                    results[i] = r;
+                }
+                pooled_passes = pass;
+            }
+        }
     }
     let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
     let (mut pictures_rewritten, mut pcm_mbs, mut corrected_mbs, mut bytes_added) = (0usize, 0usize, 0usize, 0i64);
@@ -1346,9 +1396,13 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
             o.insert("budget".into(), json!(a.drift.budget));
             o.insert("dropped_bytes".into(), json!(results.iter().map(|r| r.budget.0).sum::<usize>()));
             o.insert("periods_over_budget".into(), json!(results.iter().filter(|r| r.budget.2).count()));
+            o.insert("pooled_passes".into(), json!(pooled_passes));
             let per: Vec<Value> = results
                 .iter()
-                .map(|r| json!({"period": r.period, "dropped_bytes": r.budget.0, "added_bytes": r.budget.1, "over_budget": r.budget.2, "rounds": r.rounds}))
+                .map(|r| {
+                    json!({"period": r.period, "dropped_bytes": r.budget.0, "allowed_bytes": r.allowed.round() as i64,
+                           "added_bytes": r.budget.1, "over_budget": r.budget.2, "rounds": r.rounds})
+                })
                 .collect();
             o.insert("periods".into(), Value::Array(per));
         }
