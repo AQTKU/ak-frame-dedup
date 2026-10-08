@@ -200,11 +200,26 @@ pub struct PatchCtx<'a> {
     pub range: Range<usize>,
 }
 
-/// Source of the I_PCM records (Python's `yuv_of`).
+/// Source of the replacement records (Python's `yuv_of`): I_PCM records, or
+/// inter records with a corrected residual (same motion, same QP).
 pub trait Targets {
-    /// The I_PCM record of macroblock (mbx, mby) of picture `dec` with the
-    /// target samples. `x` and `y` are set by the caller.
+    /// The replacement record of macroblock (mbx, mby) of picture `dec`.
+    /// `x` and `y` are set by the caller.
     fn pcm(&self, dec: usize, mbx: u16, mby: u16) -> Result<Mb>;
+    /// Whether the replacement is intra (I_PCM). An inter replacement keeps
+    /// its motion, so direct blocks that use it as co-located MB stay valid.
+    fn intra(&self, _dec: usize, _mbx: u16, _mby: u16) -> bool {
+        true
+    }
+    /// A version of the replacement: a cached picture is re-encoded when the
+    /// version of one of its replacements changes.
+    fn stamp(&self, _dec: usize, _mbx: u16, _mby: u16) -> u64 {
+        0
+    }
+    /// The luma QP of an inter replacement, when it is not the original MB's.
+    fn qp(&self, _dec: usize, _mbx: u16, _mby: u16) -> Option<i32> {
+        None
+    }
 }
 
 impl<F: Fn(usize, u16, u16) -> Result<Mb>> Targets for F {
@@ -302,7 +317,7 @@ impl ParsedStore for LruStore<'_> {
 /// its co-located picture (Python: `(sorted targets, sigs.get(col))`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Sig {
-    targets: Vec<(u16, u16)>,
+    targets: Vec<(u16, u16, u64)>,
     col: Option<Arc<Sig>>,
 }
 
@@ -324,6 +339,8 @@ pub struct PatchCache(HashMap<usize, CacheEntry>);
 pub struct PatchStats {
     pub typ: SliceType,
     pub pcm: usize,
+    /// Inter MBs with a corrected residual.
+    pub corrected: usize,
     pub direct_explicit: usize,
     pub skip_explicit: usize,
     pub qp_carrier: usize,
@@ -334,7 +351,7 @@ pub struct PatchStats {
 impl PatchStats {
     /// The Python dict: `type, pcm, direct_explicit, skip_explicit, qp_carrier, bytes_before, bytes_after`.
     pub fn to_json(&self) -> Value {
-        json!({"type": self.typ.as_str(), "pcm": self.pcm, "direct_explicit": self.direct_explicit,
+        json!({"type": self.typ.as_str(), "pcm": self.pcm, "corrected": self.corrected, "direct_explicit": self.direct_explicit,
                "skip_explicit": self.skip_explicit, "qp_carrier": self.qp_carrier,
                "bytes_before": self.bytes_before, "bytes_after": self.bytes_after})
     }
@@ -417,11 +434,15 @@ pub fn patch_pictures(
         let t = p.typ();
         let col = if t == SliceType::B { Some(*p.lists[1].first().ok_or_else(|| anyhow!("list index out of range"))?) } else { None };
         let targets: BTreeSet<(u16, u16)> = patches.get(&d).map(|v| v.iter().copied().collect()).unwrap_or_default();
-        let col_pcm: BTreeSet<(u16, u16)> =
-            col.and_then(|c| patches.get(&c)).map(|v| v.iter().copied().collect()).unwrap_or_default();
+        let col_pcm: BTreeSet<(u16, u16)> = col
+            .and_then(|c| patches.get(&c).map(|v| v.iter().copied().filter(|&(x, y)| targets_src.intra(c, x, y)).collect()))
+            .unwrap_or_default();
         // nothing this picture depends on changed since the cached result:
         // reuse it without parsing anything
-        let sig = Arc::new(Sig { targets: targets.iter().copied().collect(), col: col.and_then(|c| sigs.get(&c).cloned()) });
+        let sig = Arc::new(Sig {
+            targets: targets.iter().map(|&(x, y)| (x, y, targets_src.stamp(d, x, y))).collect(),
+            col: col.and_then(|c| sigs.get(&c).cloned()),
+        });
         sigs.insert(d, sig.clone());
         if let Some(c) = cache.as_deref().and_then(|c| c.0.get(&d)) {
             if *c.sig == *sig {
@@ -449,6 +470,7 @@ pub fn patch_pictures(
             new_motion.entry(c).or_insert_with(|| cp.motion.clone());
         }
         let mut new: Vec<Mb> = dd.mbs.iter().map(copy_mb).collect();
+        let n_corr = targets.iter().filter(|&&(x, y)| !targets_src.intra(d, x, y)).count();
         if !targets.is_empty() {
             for mb in new.iter_mut() {
                 if targets.contains(&(mb.x, mb.y)) {
@@ -512,7 +534,14 @@ pub fn patch_pictures(
         // a skip MB inherits QP_pred; if a PCM in front of it changed QP_pred,
         // it has to become a coded MB so it can carry mb_qp_delta
         let slice_qp = p.slices[0].qp;
-        let target_qp = qp_chain(&dd.mbs, slice_qp);
+        let mut target_qp = qp_chain(&dd.mbs, slice_qp);
+        for (i, mb) in new.iter().enumerate() {
+            if targets.contains(&(mb.x, mb.y)) {
+                if let Some(q) = targets_src.qp(d, mb.x, mb.y) {
+                    target_qp[i] = q;
+                }
+            }
+        }
         let mut pred = slice_qp;
         let mut n_qp = 0usize;
         for i in 0..new.len() {
@@ -564,15 +593,16 @@ pub fn patch_pictures(
         }
         let nal: Nal = Arc::new(try_encode_picture(dd, ctx.spss, ctx.ppss, &mut new).with_context(|| format!("dec {d} {}", t.as_str()))?);
         log(&format!(
-            "dec {d} {}: PCM {} MB, direct->explicit {n_direct}, skip->explicit {n_skip}, qp-carrier {forced}; {}B -> {}B",
+            "dec {d} {}: PCM {} MB, corrected {n_corr} MB, direct->explicit {n_direct}, skip->explicit {n_skip}, qp-carrier {forced}; {}B -> {}B",
             t.as_str(),
-            targets.len(),
+            targets.len() - n_corr,
             dd.nal_len,
             nal.len()
         ));
         let st = PatchStats {
             typ: t,
-            pcm: targets.len(),
+            pcm: targets.len() - n_corr,
+            corrected: n_corr,
             direct_explicit: n_direct,
             skip_explicit: n_skip,
             qp_carrier: forced,
@@ -904,6 +934,7 @@ pub(crate) fn test_slice_header() -> crate::h264hdr::SliceHeader {
         rplm_bit: 0,
         rplm_end_bit: 0,
         weighted: false,
+        pwt: None,
         adaptive: false,
         mmco: Vec::new(),
         no_output_prior: None,

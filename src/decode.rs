@@ -58,9 +58,16 @@ pub struct FrameIter {
 
 /// Start decoding. `threads` is ffmpeg's `-threads`; use `FFMPEG_THREADS`.
 pub fn iter_frames(path: &Path, ranges: &[(usize, usize)], fs: usize, threads: usize) -> Result<FrameIter> {
+    iter_frames_with(path, ranges, fs, threads, &[])
+}
+
+/// [`iter_frames`] with extra decoder options (before `-i`), e.g.
+/// `["-skip_loop_filter", "all"]`.
+pub fn iter_frames_with(path: &Path, ranges: &[(usize, usize)], fs: usize, threads: usize, opts: &[&str]) -> Result<FrameIter> {
     let mut child = system::command("ffmpeg")
         .args(["-v", "error", "-threads"])
         .arg(threads.to_string())
+        .args(opts)
         .args(["-apply_cropping", "none", "-f", "h264", "-i", "-", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p"])
         .args(["-f", "rawvideo", "-"])
         .stdin(Stdio::piped())

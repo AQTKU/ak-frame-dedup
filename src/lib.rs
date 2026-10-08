@@ -18,6 +18,7 @@ pub mod picture;
 pub mod pipeline;
 pub mod plan;
 pub mod rebuild;
+pub mod recon;
 pub mod reexpress;
 pub mod records;
 pub mod repair;

@@ -1041,6 +1041,8 @@ mod tests {
             frame_mbs_only: true,
             mbaff: false,
             direct_8x8_inference: true,
+        scaling_matrix: false,
+        bit_depth: [8, 8],
             crop: [0; 4],
             vui: None,
         };
@@ -1070,6 +1072,7 @@ mod tests {
             rplm_bit: 0,
             rplm_end_bit: 0,
             weighted: false,
+        pwt: None,
             adaptive: !mmco.is_empty(),
             mmco,
             no_output_prior: None,

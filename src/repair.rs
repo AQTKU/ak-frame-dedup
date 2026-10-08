@@ -40,9 +40,11 @@ use crate::explicit::Sigma;
 use crate::h264hdr::{Picture, Ppss, SliceType, Sps, Spss};
 use crate::mv::{Motion, derive_motion};
 use crate::patch::{
-    LruStore, MapStore, Nal, PARSED_CAP, ParsedPic, ParsedStore, PatchCache, PatchCtx, PatchResult, PatchStats, patch_pictures, pcm_mb,
-    pcm_record, write_segment,
+    LruStore, MapStore, Nal, PARSED_CAP, ParsedPic, ParsedStore, PatchCache, PatchCtx, PatchResult, PatchStats, Targets, patch_pictures,
+    pcm_mb, pcm_record, qp_chain, write_segment,
 };
+use crate::recon::{Correction, Frame, add_residual, correct, predict_mb, residual};
+use crate::records::Mb;
 use crate::picture::{Parsed, decode_picture};
 use crate::stream::{new_lists, period_ranges};
 use crate::system::{FFMPEG_THREADS, Logger, REPAIR_PEAK, REPAIR_PEAK_EXPLICIT, peak_rss, pool_size};
@@ -60,6 +62,23 @@ pub const DRIFT_MAX_FRACTION: f64 = 0.02;
 pub const DRIFT_MAX_ROUNDS: usize = 12;
 /// After these rounds, each round patches every picture still over.
 pub const DRIFT_SEQUENTIAL_ROUNDS: usize = 6;
+
+/// Stopping rule of the measured repair (explicit mode).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Drift {
+    /// Macroblocks off by this much or more are patched.
+    pub threshold: u8,
+    /// At most this fraction of a picture's macroblocks is patched.
+    pub max_fraction: f64,
+    /// Repair inter MBs with residual corrections before falling back to I_PCM.
+    pub corrections: bool,
+}
+
+impl Default for Drift {
+    fn default() -> Self {
+        Drift { threshold: DRIFT_THRESHOLD, max_fraction: DRIFT_MAX_FRACTION, corrections: false }
+    }
+}
 
 /// Stack size of the worker threads (the CABAC codec and the motion
 /// derivation keep large arrays on the stack).
@@ -391,6 +410,7 @@ struct Ctx<'a> {
     sigma: Option<&'a Sigma>,
     work: &'a Path,
     orig_ranges: Vec<Range<usize>>,
+    drift: Drift,
 }
 
 impl Ctx<'_> {
@@ -508,16 +528,188 @@ fn keep_original_motion(cx: &Ctx, nd: usize) -> Result<ParsedPic> {
     Ok(ParsedPic { dd: parsed, motion: Arc::new(mo) })
 }
 
+/// A repaired macroblock of the measured repair.
+enum Fix {
+    /// An I_PCM copy of the original samples.
+    Pcm(Box<[u8; 384]>),
+    /// The original inter record with a corrected residual, its version (for
+    /// the patch cache), how many times it was corrected, and its luma QP.
+    Corr(Box<Mb>, u64, u8, i32),
+}
+
+/// The replacement records of the measured repair for `patch_pictures`.
+struct FixTargets<'a>(&'a HashMap<(usize, u16, u16), Fix>);
+
+impl Targets for FixTargets<'_> {
+    fn pcm(&self, dec: usize, x: u16, y: u16) -> Result<Mb> {
+        match self.0.get(&(dec, x, y)) {
+            Some(Fix::Pcm(s)) => Ok(pcm_mb(x, y, s.clone())),
+            Some(Fix::Corr(m, ..)) => Ok((**m).clone()),
+            None => Err(anyhow!("KeyError: no target for picture {dec} MB ({x}, {y})")),
+        }
+    }
+    fn intra(&self, dec: usize, x: u16, y: u16) -> bool {
+        !matches!(self.0.get(&(dec, x, y)), Some(Fix::Corr(..)))
+    }
+    fn stamp(&self, dec: usize, x: u16, y: u16) -> u64 {
+        match self.0.get(&(dec, x, y)) {
+            Some(Fix::Corr(_, v, ..)) => *v,
+            _ => 0,
+        }
+    }
+    fn qp(&self, dec: usize, x: u16, y: u16) -> Option<i32> {
+        match self.0.get(&(dec, x, y)) {
+            Some(Fix::Corr(.., q)) => Some(*q),
+            _ => None,
+        }
+    }
+}
+
+/// A correction is used when it brings the macroblock's pre-deblocking
+/// reconstruction within this of the original (at least 3, at most half the
+/// drift threshold); otherwise the MB gets I_PCM.
+fn corr_max_err(d: &Drift) -> u8 {
+    (d.threshold / 2).max(3)
+}
+/// A macroblock still drifting after this many corrections gets I_PCM.
+const CORR_MAX_TRIES: u8 = 2;
+
+/// Reference frames kept during one measure pass for the corrections: a
+/// frame is kept from when it is decoded until every picture of the period
+/// that lists it has been handled (pictures come in display order, their
+/// references in decode order, so a B picture can be measured before its
+/// forward reference arrives; it waits in `pending`).
+#[derive(Default)]
+struct RefFrames {
+    frames: [HashMap<usize, Vec<u8>>; 2],
+    /// Pictures still to be handled that list each picture (index 0: new
+    /// decode indices in new lists; 1: original decode indices in original lists).
+    readers: [HashMap<usize, usize>; 2],
+}
+
+impl RefFrames {
+    fn refs(cx: &Ctx, nd: usize) -> [BTreeSet<usize>; 2] {
+        let l = |p: &Picture| p.lists.iter().flatten().copied().filter(|&r| r != NONE).collect::<BTreeSet<usize>>();
+        [l(&cx.new_pics[nd]), l(&cx.pics[cx.orig_of_new[nd]])]
+    }
+
+    fn new(cx: &Ctx, order: &[usize]) -> Self {
+        let mut r = RefFrames::default();
+        for &nd in order {
+            for (s, set) in Self::refs(cx, nd).into_iter().enumerate() {
+                for x in set {
+                    *r.readers[s].entry(x).or_default() += 1;
+                }
+            }
+        }
+        r
+    }
+
+    fn offer(&mut self, s: usize, dec: usize, fr: &[u8]) {
+        if self.readers[s].get(&dec).is_some_and(|&n| n > 0) {
+            self.frames[s].insert(dec, fr.to_vec());
+        }
+    }
+
+    fn ready(&self, cx: &Ctx, nd: usize) -> bool {
+        Self::refs(cx, nd).iter().enumerate().all(|(s, set)| set.iter().all(|r| self.frames[s].contains_key(r)))
+    }
+
+    fn release(&mut self, cx: &Ctx, nd: usize) {
+        for (s, set) in Self::refs(cx, nd).into_iter().enumerate() {
+            for x in set {
+                if let Some(n) = self.readers[s].get_mut(&x) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.frames[s].remove(&x);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Motion `m` with its reference pictures looked up in `lists` (decode
+/// indices of another stream with the same reference indices).
+fn remap_refs(m: &Motion, lists: &[Vec<usize>; 2]) -> Result<Motion> {
+    let mut n = m.clone();
+    for l in 0..2 {
+        for i in 0..n.refidx[l].len() {
+            let r = n.refidx[l][i];
+            n.refpic[l][i] = if r >= 0 {
+                let p = *lists[l].get(r as usize).ok_or_else(|| anyhow!("reference index {r} outside list {l}"))?;
+                if p == NONE {
+                    bail!("reference index {r} of list {l} names a dropped picture without substitute");
+                }
+                p as i32
+            } else {
+                -1
+            };
+        }
+    }
+    Ok(n)
+}
+
+/// Corrections for the inter macroblocks `mbs` of picture `nd` of the new
+/// stream: the original's pre-deblocking reconstruction is the target, the
+/// prediction is the one the new stream makes from its decoded references.
+/// The current record of an MB is its last correction, if any.
+fn corrections(
+    cx: &Ctx,
+    nd: usize,
+    mbs: &[(u16, u16)],
+    refs: &RefFrames,
+    fixes: &HashMap<(usize, u16, u16), Fix>,
+) -> Result<HashMap<(u16, u16), Correction>> {
+    let sps = cx.sps()?;
+    let d = cx.orig_of_new[nd];
+    let (dd, mo) = orig_motion(cx, d)?;
+    let pps = cx.ppss.get(&dd.sl.pps_id).ok_or_else(|| anyhow!("KeyError: pps {}", dd.sl.pps_id))?;
+    let mn = remap_refs(&mo, &cx.new_pics[nd].lists)?;
+    let qps = qp_chain(&dd.mbs, dd.sl.qp);
+    let orig_ref = |r: usize| refs.frames[1].get(&r).map(|f| Frame::new(f, sps));
+    let new_ref = |r: usize| refs.frames[0].get(&r).map(|f| Frame::new(f, sps));
+    let mut out = HashMap::new();
+    for &(x, y) in mbs {
+        let i = y as usize * sps.mb_w + x as usize;
+        let orig = &dd.mbs[i];
+        if orig.intra {
+            continue;
+        }
+        let (base, bqp) = match fixes.get(&(nd, x, y)) {
+            Some(Fix::Corr(m, .., q)) => (&**m, *q),
+            Some(Fix::Pcm(_)) => continue,
+            None => (orig, qps[i]),
+        };
+        let opred = predict_mb(pps, &cx.pics[d], cx.pics, &mo, x as usize, y as usize, &orig_ref)?;
+        let target = add_residual(&opred, &residual(orig, qps[i], pps)?);
+        let npred = predict_mb(pps, &cx.new_pics[nd], cx.new_pics, &mn, x as usize, y as usize, &new_ref)?;
+        let c = correct(base, bqp, pps, &npred, &target, corr_max_err(&cx.drift)).with_context(|| format!("picture {nd} MB ({x}, {y})"))?;
+        if std::env::var_os("FD_CORR_DEBUG").is_some() {
+            let pre = npred.iter().zip(&target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+            let cur = add_residual(&npred, &residual(base, bqp, pps)?);
+            let now = cur.iter().zip(&target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+            eprintln!("CORR nd {nd} ({x},{y}) {} skip {} qp {bqp} pred-target {pre} current {now} -> err {} at qp {} cbp {:#x}->{:#x}",
+                      cx.new_pics[nd].typ().as_str(), base.skip, c.err, c.qp, base.cbp, c.mb.cbp);
+        }
+        out.insert((x, y), c);
+    }
+    Ok(out)
+}
+
 /// Explicit mode: kept pictures keep their reference indices and mvs; only
 /// reads of a dropped picture D now read its substitute K. B pictures whose
 /// co-located picture was D keep their original motion: direct blocks whose
 /// derived motion would change are made explicit. Then the period is decoded
-/// and compared with the original, and drifting MBs are patched (see
-/// [`DRIFT_THRESHOLD`]).
+/// and compared with the original, and drifting MBs are repaired (see
+/// [`Drift`]): with corrections, an inter MB first gets a corrected residual
+/// ([`crate::recon::correct`]); intra MBs, and MBs a correction cannot fix,
+/// become I_PCM copies of the original.
 ///
 /// Memory stays bounded however many IDR periods anchor rebuilds merged: the
 /// original is decoded again in lockstep every round, only the target frames
-/// of patched pictures are kept, and parsed pictures live in an LRU.
+/// of patched pictures and the reference frames still needed are kept, and
+/// parsed pictures live in an LRU.
 fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     let t0 = Instant::now();
     let sigma = cx.sigma.ok_or_else(|| anyhow!("explicit repair needs sigma"))?;
@@ -526,6 +718,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     let fs = frame_size(sps);
     let (pics, new_pics, orig_of_new) = (cx.pics, cx.new_pics, cx.orig_of_new);
     let new_range = task.new.clone();
+    let use_corr = cx.drift.corrections;
 
     let force: BTreeSet<usize> = new_range
         .clone()
@@ -538,12 +731,14 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
 
     let mut order: Vec<usize> = new_range.clone().collect();
     order.sort_by_key(|&nd| new_pics[nd].poc); // stable, like sorted(key=poc)
-    let budget = ((DRIFT_MAX_FRACTION * w as f64 * h as f64) as usize).max(1);
+    let budget = ((cx.drift.max_fraction * w as f64 * h as f64) as usize).max(1);
     let tmp = TmpFile(cx.work.join(format!("drift_{}.h264", task.period)));
 
     type Samples = Box<[u8; 384]>;
+    // every repaired MB per picture (sorted), and what it was replaced by
     let mut patches: BTreeMap<usize, Vec<(u16, u16)>> = BTreeMap::new();
-    let mut target: HashMap<(usize, u16, u16), Samples> = HashMap::new();
+    let mut fixes: HashMap<(usize, u16, u16), Fix> = HashMap::new();
+    let mut version = 0u64;
     let mut cache = PatchCache::default();
     let mut seen: HashMap<usize, ((u64, u64), Vec<u8>)> = HashMap::new();
     let mut capped: BTreeSet<usize> = BTreeSet::new();
@@ -553,11 +748,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     let mut res: PatchResult;
     loop {
         let ctx = PatchCtx { es: cx.new_es, spss: cx.spss, ppss: cx.ppss, pics: new_pics, range: new_range.clone() };
-        let targets = |dec: usize, x: u16, y: u16| -> Result<crate::records::Mb> {
-            let s = target.get(&(dec, x, y)).ok_or_else(|| anyhow!("KeyError: no target for picture {dec} MB ({x}, {y})"))?;
-            Ok(pcm_mb(x, y, s.clone()))
-        };
-        res = patch_pictures(&ctx, &patches, &targets, &mut store as &mut dyn ParsedStore, &force, Some(&mut cache), &mut |_| {})?;
+        res = patch_pictures(&ctx, &patches, &FixTargets(&fixes), &mut store as &mut dyn ParsedStore, &force, Some(&mut cache), &mut |_| {})?;
         {
             let mut f = BufWriter::with_capacity(1 << 20, File::create(&tmp.0).with_context(|| format!("cannot create {}", tmp.0.display()))?);
             write_segment(cx.new_es, new_pics, new_range.start, new_range.end, &res.repl, &mut f)?;
@@ -565,6 +756,9 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         }
         viol = BTreeMap::new();
         let mut keep: HashMap<usize, HashMap<(u16, u16), Samples>> = HashMap::new();
+        let mut corr: HashMap<usize, HashMap<(u16, u16), Correction>> = HashMap::new();
+        let mut refs = if use_corr { RefFrames::new(cx, &order) } else { RefFrames::default() };
+        let mut pending: Vec<(usize, Vec<(u16, u16)>)> = Vec::new();
         let mut ogen = OrigFrames { cx, periods: &task.orig_periods, next_period: 0, cur: None, fs };
         let mut n_out = 0usize;
         {
@@ -576,12 +770,21 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                     break;
                 }
                 n_out += 1;
+                if use_corr {
+                    refs.offer(0, nd, &fr);
+                }
                 let want = orig_of_new[nd];
                 let ofr = loop {
                     // the mapping is monotone: skip dropped originals
                     match ogen.next()? {
-                        Some((d, f)) if d == want => break f,
-                        Some(_) => {}
+                        Some((d, f)) => {
+                            if use_corr {
+                                refs.offer(1, d, &f);
+                            }
+                            if d == want {
+                                break f;
+                            }
+                        }
                         None => bail!("original picture {want} not found in decode order"),
                     }
                 };
@@ -591,40 +794,74 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                     seen.insert(nd, (key, visible_maxdiff(&fr, &ofr, sps)));
                 }
                 let m = &seen[&nd].1;
-                let done = patches.get(&nd).map(Vec::as_slice).unwrap_or(&[]);
                 let mut bad: Vec<(u8, u16, u16)> = Vec::new();
                 for (i, &v) in m.iter().enumerate() {
-                    if v >= DRIFT_THRESHOLD {
+                    if v >= cx.drift.threshold {
                         let (x, y) = ((i % w) as u16, (i / w) as u16);
-                        if done.binary_search(&(x, y)).is_err() {
+                        // I_PCM is final; a corrected MB may be corrected again
+                        if !matches!(fixes.get(&(nd, x, y)), Some(Fix::Pcm(_))) {
                             bad.push((v, x, y));
                         }
                     }
                 }
                 worst.insert(nd, m.iter().copied().max().unwrap_or(0));
-                if !bad.is_empty() {
+                if bad.is_empty() {
+                    if use_corr {
+                        refs.release(cx, nd);
+                    }
+                } else {
                     bad.sort_by(|a, b| b.cmp(a)); // sorted(..., reverse=True)
                     // keep the original samples of the MBs that may be patched
                     // (not whole frames: a merged period can hold hundreds)
-                    let room = budget as i64 - done.len() as i64;
-                    let k = room.max(0) as usize;
+                    let done = patches.get(&nd).map_or(0, Vec::len);
+                    let k = (budget as i64 - done as i64).max(0) as usize;
                     let samples: HashMap<(u16, u16), Samples> = bad
                         .iter()
+                        .filter(|&&(_, x, y)| !fixes.contains_key(&(nd, x, y)))
                         .take(k)
+                        .chain(bad.iter().filter(|&&(_, x, y)| fixes.contains_key(&(nd, x, y))))
                         .map(|&(_, x, y)| ((x, y), pcm_record(&ofr, w, x as usize, y as usize).samples.expect("PCM record has samples")))
                         .collect();
+                    if use_corr {
+                        pending.push((nd, samples.keys().copied().collect()));
+                    }
                     keep.insert(nd, samples);
                     viol.insert(nd, bad);
+                }
+                // corrections of pictures whose references have all arrived
+                if use_corr {
+                    let mut i = 0;
+                    while i < pending.len() {
+                        let nd = pending[i].0;
+                        if refs.ready(cx, nd) {
+                            let (nd, mbs) = pending.swap_remove(i);
+                            corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+                            refs.release(cx, nd);
+                        } else {
+                            i += 1;
+                        }
+                    }
                 }
             }
             drop(it);
         }
         // let the original decoder finish cleanly
-        while ogen.next()?.is_some() {}
+        while let Some((d, f)) = ogen.next()? {
+            if use_corr {
+                refs.offer(1, d, &f);
+            }
+        }
         drop(ogen);
         if n_out != order.len() {
             bail!("period {}: decoded {n_out} of {} pictures", task.period, order.len());
         }
+        for (nd, mbs) in std::mem::take(&mut pending) {
+            if !refs.ready(cx, nd) {
+                bail!("period {}: reference frames of picture {nd} never arrived", task.period);
+            }
+            corr.insert(nd, corrections(cx, nd, &mbs, &refs, &fixes)?);
+        }
+        drop(refs);
         rounds += 1;
         let todo: Vec<usize> = viol.keys().copied().filter(|nd| !capped.contains(nd)).collect();
         if todo.is_empty() || rounds > DRIFT_MAX_ROUNDS {
@@ -637,17 +874,38 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
             let have = patches.get(&nd).map_or(0, Vec::len);
             let room = budget as i64 - have as i64;
             let v = &viol[&nd];
-            if v.len() as i64 > room {
+            let fresh = v.iter().filter(|&&(_, x, y)| !fixes.contains_key(&(nd, x, y))).count();
+            if fresh as i64 > room {
                 capped.insert(nd);
             }
-            let mbs: Vec<(u16, u16)> = v.iter().take(room.max(0) as usize).map(|&(_, x, y)| (x, y)).collect();
+            let mut mbs: Vec<(u16, u16)> = v.iter().filter(|&&(_, x, y)| fixes.contains_key(&(nd, x, y))).map(|&(_, x, y)| (x, y)).collect();
+            mbs.extend(v.iter().filter(|&&(_, x, y)| !fixes.contains_key(&(nd, x, y))).take(room.max(0) as usize).map(|&(_, x, y)| (x, y)));
             if !mbs.is_empty() {
                 let mut all: BTreeSet<(u16, u16)> = patches.get(&nd).map(|p| p.iter().copied().collect()).unwrap_or_default();
                 all.extend(mbs.iter().copied());
                 patches.insert(nd, all.into_iter().collect());
                 let kept = keep.get_mut(&nd).expect("kept samples for every violating picture");
+                let cs = corr.get(&nd);
                 for &(x, y) in &mbs {
-                    target.insert((nd, x, y), kept.remove(&(x, y)).expect("kept sample"));
+                    let tries = match fixes.get(&(nd, x, y)) {
+                        Some(Fix::Corr(_, _, n, _)) => *n,
+                        _ => 0,
+                    };
+                    let usable = cs.and_then(|c| c.get(&(x, y))).filter(|c| {
+                        let unchanged = match fixes.get(&(nd, x, y)) {
+                            Some(Fix::Corr(m, _, _, q)) => **m == c.mb && *q == c.qp,
+                            _ => false,
+                        };
+                        c.err <= corr_max_err(&cx.drift) && tries < CORR_MAX_TRIES && !unchanged
+                    });
+                    let fix = match usable {
+                        Some(c) => {
+                            version += 1;
+                            Fix::Corr(Box::new(c.mb.clone()), version, tries + 1, c.qp)
+                        }
+                        None => Fix::Pcm(kept.remove(&(x, y)).expect("kept sample")),
+                    };
+                    fixes.insert((nd, x, y), fix);
                 }
             }
             if new_pics[nd].ref_idc != 0 && rounds <= DRIFT_SEQUENTIAL_ROUNDS {
@@ -660,11 +918,16 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     let mut all: BTreeSet<usize> = patches.keys().copied().collect();
     all.extend(viol.keys().copied());
     all.extend(force.iter().copied());
+    let n_corr = |nd: usize| patches.get(&nd).map_or(0, |v| v.iter().filter(|&&(x, y)| matches!(fixes.get(&(nd, x, y)), Some(Fix::Corr(..)))).count());
     for nd in all {
         let d = orig_of_new[nd];
-        sniff.push(json!({"dec": d, "display": pics[d].disp, "type": pics[d].typ().as_str(),
+        let mut s = json!({"dec": d, "display": pics[d].disp, "type": pics[d].typ().as_str(),
                           "mbs": patches.get(&nd).map_or(0, Vec::len), "worst_after": worst.get(&nd).copied().unwrap_or(0),
-                          "over_threshold_after": viol.get(&nd).map_or(0, Vec::len), "capped": capped.contains(&nd)}));
+                          "over_threshold_after": viol.get(&nd).map_or(0, Vec::len), "capped": capped.contains(&nd)});
+        if use_corr {
+            s["corrected"] = json!(n_corr(nd));
+        }
+        sniff.push(s);
     }
     Ok(TaskResult {
         period: task.period,
@@ -856,6 +1119,7 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
             sigma: a.sigma,
             work: a.work,
             orig_ranges: period_ranges(pics),
+            drift: a.drift,
         };
         let n_tasks = tasks.len();
         let work = |t: &Task| if explicit { run_task_explicit(&cx, t) } else { run_task_exact(&cx, t) };
@@ -873,7 +1137,7 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         })?;
     }
     let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
-    let (mut pictures_rewritten, mut pcm_mbs, mut bytes_added) = (0usize, 0usize, 0i64);
+    let (mut pictures_rewritten, mut pcm_mbs, mut corrected_mbs, mut bytes_added) = (0usize, 0usize, 0usize, 0i64);
     let (mut skip_to_explicit, mut direct_to_explicit, mut qp_carriers) = (0usize, 0usize, 0usize);
     let mut sniff: Vec<Value> = Vec::new();
     let mut pictures: Vec<Value> = Vec::new();
@@ -886,6 +1150,7 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         for (&nd, s) in &r.stats {
             pictures_rewritten += 1;
             pcm_mbs += s.pcm;
+            corrected_mbs += s.corrected;
             bytes_added += s.bytes_after as i64 - s.bytes_before as i64;
             skip_to_explicit += s.skip_explicit;
             direct_to_explicit += s.direct_explicit;
@@ -908,8 +1173,11 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
     });
     let o = summary.as_object_mut().expect("object");
     if explicit {
-        o.insert("drift_threshold".into(), json!(DRIFT_THRESHOLD));
-        o.insert("drift_max_per_picture".into(), json!((DRIFT_MAX_FRACTION * sps.mb_w as f64 * sps.mb_h as f64) as usize));
+        o.insert("drift_threshold".into(), json!(a.drift.threshold));
+        if a.drift.corrections {
+            o.insert("corrected_mbs".into(), json!(corrected_mbs));
+        }
+        o.insert("drift_max_per_picture".into(), json!(((a.drift.max_fraction * sps.mb_w as f64 * sps.mb_h as f64) as usize).max(1)));
         o.insert("seconds".into(), json!(round1(results.iter().map(|r| r.seconds).sum::<f64>())));
     }
     if explicit {
@@ -951,6 +1219,8 @@ pub struct RepairArgs<'a> {
     pub work: &'a Path,
     /// Explicit mode: the original decode index of every new picture.
     pub orig_of_out: Option<&'a [usize]>,
+    /// Explicit mode: the stopping rule of the measured repair.
+    pub drift: Drift,
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1276,7 @@ pub fn dev_repair(args: &[String]) -> Result<()> {
             sigma: sigma.as_ref(),
             work: &work,
             orig_of_out: orig_of_out.as_deref(),
+            drift: Drift::default(),
         },
         &log,
     )?;

@@ -846,6 +846,7 @@ fn dummy_picture(p: &PicIn) -> Picture {
         rplm_bit: 0,
         rplm_end_bit: 0,
         weighted: false,
+        pwt: None,
         mmco: Vec::new(),
         adaptive: false,
         no_output_prior: None,

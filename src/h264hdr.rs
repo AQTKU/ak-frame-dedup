@@ -112,6 +112,10 @@ pub struct Sps {
     pub frame_mbs_only: bool,
     pub mbaff: bool,
     pub direct_8x8_inference: bool,
+    /// seq_scaling_matrix_present_flag (the lists themselves are skipped).
+    pub scaling_matrix: bool,
+    /// bit_depth_luma, bit_depth_chroma.
+    pub bit_depth: [u32; 2],
     /// left, right, top, bottom (in the SPS's units; the Python code doubles them for 4:2:0).
     pub crop: [u32; 4],
     pub vui: Option<Vui>,
@@ -146,6 +150,15 @@ pub struct Mmco {
     pub args: Vec<u32>,
 }
 
+/// pred_weight_table: log2 denominators and, per list and reference index,
+/// (weight, offset) for Y, Cb, Cr (inferred entries filled in).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredWeights {
+    pub luma_denom: u32,
+    pub chroma_denom: u32,
+    pub lists: [Vec<[(i32, i32); 3]>; 2],
+}
+
 /// A parsed slice header. `*_bit` fields are bit offsets in the slice RBSP
 /// (after the NAL header byte). Options are `None` where the Python dict
 /// lacks the key.
@@ -172,6 +185,8 @@ pub struct SliceHeader {
     pub rplm_bit: usize,
     pub rplm_end_bit: usize,
     pub weighted: bool,
+    /// pred_weight_table, when `weighted`.
+    pub pwt: Option<Box<PredWeights>>,
     pub mmco: Vec<Mmco>,
     /// adaptive_ref_pic_marking_mode_flag (non-IDR reference slices).
     pub adaptive: bool,
@@ -258,16 +273,17 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let id = b.ue()?;
     let mut chroma_format_idc = 1;
     let mut separate_colour_plane = false;
+    let (mut scaling_matrix, mut bit_depth) = (false, [8, 8]);
     if HIGH_PROFILES.contains(&profile_idc) {
         chroma_format_idc = b.ue()?;
         if chroma_format_idc == 3 {
             separate_colour_plane = b.flag()?;
         }
-        b.ue()?;
-        b.ue()?;
+        bit_depth = [b.ue()?.saturating_add(8), b.ue()?.saturating_add(8)];
         b.u(1)?;
         if b.flag()? {
             // seq_scaling_matrix_present
+            scaling_matrix = true;
             for i in 0..(if chroma_format_idc != 3 { 8 } else { 12 }) {
                 if b.flag()? {
                     skip_scaling_list(&mut b, if i < 6 { 16 } else { 64 })?;
@@ -322,6 +338,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         frame_mbs_only,
         mbaff,
         direct_8x8_inference,
+        scaling_matrix,
+        bit_depth,
         crop,
         vui,
     })
@@ -594,26 +612,27 @@ pub fn parse_slice(rbsp: &[u8], nal_type: u8, nal_ref_idc: u8, spss: &Spss, ppss
     let rplm_end_bit = b.p;
     // pred_weight_table
     let mut weighted = false;
+    let mut pwt = None;
     if (pps.weighted_pred && matches!(t, SliceType::P | SliceType::SP)) || (pps.weighted_bipred_idc == 1 && t == SliceType::B) {
         weighted = true;
-        b.ue()?;
-        if sps.chroma_format_idc != 0 {
-            b.ue()?;
-        }
-        for n in [num_ref_l0, num_ref_l1] {
+        let luma_denom = b.ue()?;
+        let chroma_denom = if sps.chroma_format_idc != 0 { b.ue()? } else { 0 };
+        let mut w = PredWeights { luma_denom, chroma_denom, lists: [Vec::new(), Vec::new()] };
+        for (l, n) in [num_ref_l0, num_ref_l1].into_iter().enumerate() {
             for _ in 0..n {
+                // inferred: weight 2^denom, offset 0
+                let mut e = [(1 << luma_denom, 0), (1 << chroma_denom, 0), (1 << chroma_denom, 0)];
                 if b.flag()? {
-                    b.se()?;
-                    b.se()?;
+                    e[0] = (b.se()?, b.se()?);
                 }
                 if sps.chroma_format_idc != 0 && b.flag()? {
-                    b.se()?;
-                    b.se()?;
-                    b.se()?;
-                    b.se()?;
+                    e[1] = (b.se()?, b.se()?);
+                    e[2] = (b.se()?, b.se()?);
                 }
+                w.lists[l].push(e);
             }
         }
+        pwt = Some(Box::new(w));
     }
     // dec_ref_pic_marking, spanning [drpm_bit, drpm_end_bit)
     let mut mmco = Vec::new();
@@ -684,6 +703,7 @@ pub fn parse_slice(rbsp: &[u8], nal_type: u8, nal_ref_idc: u8, spss: &Spss, ppss
         rplm_bit,
         rplm_end_bit,
         weighted,
+        pwt,
         mmco,
         adaptive,
         no_output_prior,

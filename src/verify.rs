@@ -80,15 +80,23 @@ fn check(a: &[u8], b: &[u8], mb_w: usize, mb_h: usize) -> (usize, usize) {
 /// Per-macroblock max absolute difference over Y, U and V, plus the luma-only
 /// map. Both are row-major `mb_h` x `mb_w` arrays. Mirrors `verify.mb_maxdiff`.
 pub fn mb_maxdiff(a: &[u8], b: &[u8], mb_w: usize, mb_h: usize) -> (Vec<u8>, Vec<u8>) {
+    mb_maxdiff_in(a, b, mb_w, mb_h, [0; 4])
+}
+
+/// [`mb_maxdiff`] counting only pixels inside the crop window `crop` (left,
+/// right, top, bottom in luma pixels).
+pub fn mb_maxdiff_in(a: &[u8], b: &[u8], mb_w: usize, mb_h: usize, crop: [usize; 4]) -> (Vec<u8>, Vec<u8>) {
     let (w, h) = check(a, b, mb_w, mb_h);
+    let [cl, cr, ct, cb] = crop;
+    let vis = |s: usize, pw: usize, ph: usize| (cl / s, pw - cr / s, ct / s, ph - cb / s);
     let n = mb_w * mb_h;
     let mut ly = vec![0u8; n];
-    plane_blocks::<16>(&a[..w * h], &b[..w * h], w, (0, w, 0, h), &mut ly);
+    plane_blocks::<16>(&a[..w * h], &b[..w * h], w, vis(1, w, h), &mut ly);
     let mut all = ly.clone();
     let (cw, ch) = (w / 2, h / 2);
     let (u0, v0) = (w * h, w * h * 5 / 4);
     for (o, e) in [(u0, v0), (v0, a.len())] {
-        plane_blocks::<8>(&a[o..e], &b[o..e], cw, (0, cw, 0, ch), &mut all);
+        plane_blocks::<8>(&a[o..e], &b[o..e], cw, vis(2, cw, ch), &mut all);
     }
     (all, ly)
 }
@@ -314,7 +322,9 @@ fn job_body(c: &Ctx, job: &Job, res: &mut JobResult) -> std::result::Result<(), 
             let key = job.okeys[i];
             i += 1;
             if let Some(fnew) = bad.remove(&key) {
-                let (m, ly) = mb_maxdiff(&buf, &fnew, mb_w, mb_h);
+                // statistics over the visible area: the rows below the crop window
+                // are never shown (a frame still differs if they differ)
+                let (m, ly) = mb_maxdiff_in(&buf, &fnew, mb_w, mb_h, c.crop);
                 let display = *job.disp_of.get(&key).ok_or(JobError::Key(key))?;
                 let df = DiffFrame {
                     display,
@@ -775,6 +785,8 @@ fn test_sps_base() -> Sps {
         frame_mbs_only: true,
         mbaff: false,
         direct_8x8_inference: true,
+        scaling_matrix: false,
+        bit_depth: [8, 8],
         crop: [0; 4],
         vui: None,
     }

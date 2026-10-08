@@ -82,6 +82,15 @@ pub struct Args {
     /// detect and plan only; write no video
     #[arg(long)]
     pub dry_run: bool,
+    /// explicit mode: patch macroblocks off by this much or more (default 16)
+    #[arg(long, default_value_t = crate::repair::DRIFT_THRESHOLD, value_parser = clap::value_parser!(u8).range(1..), hide = true)]
+    pub drift_threshold: u8,
+    /// explicit mode: patch at most this fraction of a picture (default 0.02)
+    #[arg(long, default_value_t = crate::repair::DRIFT_MAX_FRACTION, hide = true)]
+    pub drift_cap: f64,
+    /// explicit mode: repair inter MBs with residual corrections before I_PCM
+    #[arg(long, hide = true)]
+    pub drift_corrections: bool,
 }
 
 /// No duplicate-frame cadence was found (exit code 2).
@@ -684,6 +693,7 @@ impl Run {
                     sigma: None,
                     work: &self.work,
                     orig_of_out: None,
+                    drift: Default::default(),
                 },
                 &self.log,
             )?;
@@ -802,6 +812,11 @@ impl Run {
                     sigma: Some(&sigma),
                     work: &self.work,
                     orig_of_out: Some(&orig_of_out),
+                    drift: crate::repair::Drift {
+                        threshold: self.a.drift_threshold,
+                        max_fraction: self.a.drift_cap,
+                        corrections: self.a.drift_corrections,
+                    },
                 },
                 &self.log,
             )?;

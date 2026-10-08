@@ -38,6 +38,7 @@ pub fn main(args: &[String]) -> Result<()> {
         "patch-replay" => crate::patch::dev_patch_replay(rest),
         "repair" => crate::repair::dev_repair(rest),
         "rebuild" => crate::rebuild::dev_rebuild(rest),
+        "recon" => crate::recon::dev_recon(rest),
         _ => bail!("unknown dev command {cmd:?}"),
     }
 }
