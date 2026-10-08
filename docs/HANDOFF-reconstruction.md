@@ -1,24 +1,39 @@
-# Handoff: pre-deblock reconstruction, cheaper patches and a byte budget
+# Handoff: spend more of the freed bytes on repair (byte budget, then residual corrections)
 
-This brief is for a fresh session. Read `README.md` first, especially "Explicit mode". `docs/HANDOFF.md` and `docs/HANDOFF-anchor-rebuild.md` give the earlier design background.
+This brief is for a fresh session. Read `README.md` first, especially "How it works" and "Explicit mode". `docs/HANDOFF.md` and `docs/HANDOFF-anchor-rebuild.md` are older design background; skim them only if something here is unclear.
 
-**Stage 1 (the port of the core) is done:** since 2.0.0 the whole tool is Rust, byte-identical to Python v1.2.0. This brief was written against the Python modules; their Rust counterparts keep the same names (`h264cabac.py` → `src/cabac.rs`, `h264mv.py` → `src/mv.rs` and `src/reexpress.rs`, `patch.py` → `src/patch.rs`, `repair.py` → `src/repair.rs`, `explicit.py` → `src/explicit.rs`, `h264hdr.py` → `src/h264hdr.rs`). Build the reconstruction in Rust too. The Python tests mentioned below were removed with the Python code.
+## The goal in one paragraph
 
-## Where things stand (v1.2.0)
+The tool removes the duplicate frames that streaming services insert when converting 23.976 fps film to 29.97 fps, by H.264 bitstream surgery with no re-encode. Dropping a picture that other pictures read changes what they predict from. On the x264 B-pyramid encodes (the Amazon file) the dropped twin D and its substitute K are two separate encodes of the same source frame, so every block that read D now reads slightly different pixels. The tool repairs this by measurement: decode, compare with the original, and replace macroblocks that drifted by 16 levels or more with I_PCM copies of the original pixels. Dropping the duplicates frees about 7% of the stream. The repair spends only about 12% of that freed room. **The owner wants more of that room spent on fidelity.** The plan:
+1. replace the fixed threshold with a byte budget;
+2. make each patch much cheaper with residual corrections instead of PCM.
 
-The tool handles three kinds of input.
+## Where things stand (v2.0.0, branch `main`)
 
-- **The Canadian encodes** (`sample.mkv`, `foliage.mkv`, `smoke.mkv`) have non-reference B pictures and temporal direct prediction. Their hard drops are rare (26-93 per file) and are repaired exactly with I_PCM.
-- **x264 B-pyramid encodes with MMCO and list modification** (`mmco-or-ref-list-modification.mkv`, Amazon) go through **explicit mode** (`frame_dedup/explicit.py`):
-  - The headers of the kept pictures are rewritten so that every list entry and the DPB contents equal the originals, except that the dropped twin D is replaced by its substitute K.
-  - Here D and K are two separate encodes of the same source frame and differ by encode noise everywhere: luma MAD 0.5-1.2, and almost no macroblock matches exactly. Exact repair would PCM nearly every block that reads D: 78,020 MBs (+30 MB) for 12 drops.
-  - Explicit mode therefore **repairs by measurement** (`repair.run_task_explicit`):
-    1. Decode the IDR period of the new stream.
-    2. Compare it with the original over the visible area.
-    3. I_PCM every MB that is off by `DRIFT_THRESHOLD` = 16 or more, in decode order up to the first reference picture. Patching that picture also fixes what is predicted from it.
-    4. Repeat. At most `DRIFT_MAX_FRACTION` = 2% of any picture is patched.
+- The whole tool is Rust (crate at the repo root, binary `frame-dedup`). It was ported from Python v1.2.0 with per-stream MD5-identical output. The Python is gone; its last commit is `571a346`.
+- 2.0.0 also added A/V sync points at hard cuts and static frames (`plan::sync_correct`). This is done and verified; nothing to do there.
+- There is no git remote. Commit on a feature branch and merge into `main` when the owner OKs it.
+- Build: `cargo build --release`. Tests: `cargo test --release`, which takes about 2 minutes. The three oracle tests in `tests/` compare against cached Python outputs in `work/port/oracle/`.
 
-### What the measured repair leaves (5-minute clip of the Amazon file)
+### The three kinds of input
+
+- **The Canadian encodes** (`sample.mkv`, `foliage.mkv`, `smoke.mkv`) have non-reference B pictures and temporal direct prediction.
+  - Their few hard drops (26-93 per file) are repaired *exactly*: header-only reference analysis plus I_PCM (`repair::run_task_exact`).
+  - They leave 1-8 levels around the PCM patches, from deblocking across PCM edges.
+- **x264 B-pyramid encodes with MMCO and list modification** (`mmco-or-ref-list-modification.mkv`, Amazon) go through **explicit mode** (`src/explicit.rs`).
+  - Headers are rewritten so that every list entry and the DPB contents equal the originals, with D replaced by K.
+  - D and K differ by encode noise everywhere: luma MAD 0.5-1.2, and almost no MB matches exactly.
+  - Repair is by measurement (`repair::run_task_explicit`, `src/repair.rs` around line 521). Per IDR period of the new stream:
+    1. patch, write the segment and decode it with ffmpeg;
+    2. decode the original in lockstep;
+    3. diff each picture over the visible area (`verify::visible_maxdiff`);
+    4. queue MBs at `DRIFT_THRESHOLD` = 16 or more, worst first, capped at `DRIFT_MAX_FRACTION` = 2% of the picture (163 MBs at 1080p);
+    5. patch in decode order up to the first reference picture (`DRIFT_SEQUENTIAL_ROUNDS` = 6, then everything), and repeat (`DRIFT_MAX_ROUNDS` = 12).
+- **nodupes.mkv** must fail out with exit code 2. It's a regression check only.
+
+### Baseline numbers to beat
+
+5-minute Amazon clip, `work/mmco/clip.mkv`. Rust 2.0 output: `work/port/e2e/clip.rs.mkv`, report `clip.json`, per-MB export `clip.mb.json`.
 
 | | |
 |---|---|
@@ -28,163 +43,124 @@ The tool handles three kinds of input.
 | differing frames: median frame MAD | 0.11 |
 | differing frames: median / p90 / max pixel error | 9 / 15 / 41 |
 | MBs off by ≥ 4 / ≥ 8 / ≥ 16 / ≥ 32 (luma, visible) | 1.21M / 176k / 14.3k / 48 |
-| pictures still over the threshold (PCM budget exhausted) | 39 |
+| pictures still over the threshold (PCM cap hit) | 39 |
 
-The repair spends **12% of the bytes the drops free**. The owner is interested in spending more of that room on more patches. The full-length results are in the last section.
+Full Amazon file. Rust 2.0 with sync points: `work/sync/full.mkv` and `work/sync/full.json`.
 
-## The ideas
+| | |
+|---|---|
+| frames | 150,499 → 120,400; 2,716 hard pairs; 423 anchor rebuilds (they chain: up to 18 IDR periods merge into one new period of up to 864 pictures) |
+| repair | 149,483 PCM MBs, **+56.2 MB** (1.0% of the stream; the drops freed about 7%); 202,687 skips and 130,196 direct MBs made explicit |
+| left over the threshold | 291 pictures, **all at the 2% PCM cap**; visible worst 56 |
+| verify | 73,476 bit-exact, 46,924 differ, **0 outside** hard-drop neighbourhoods and rebuilt leading pictures |
+| runtime | 33.5 min with 16 workers: proxy 3.6 min, repair 21 min, verify 8 min. Process peak 6.7 GB. |
 
-### 1. Spend a byte budget instead of a fixed threshold
+## Step 1: a byte budget instead of a fixed threshold
 
 Replace the stopping rule of the measure-and-patch loop. The loop itself stays as it is.
 
-- **Budget per IDR period of the new stream:** β × (bytes of the pictures dropped in that period), with β around 0.5 as a starting point. Unspent budget could carry over to later periods.
-- **Spend worst-first** by a visibility-weighted score, not raw max difference:
-  - **Propagation:** an error in a reference picture lives until the next IDR. Weight it by the number of pictures decoded after it in the period, or by the actual downstream error measured in the previous round.
-  - **Masking:** drift in flat or static areas is far more visible than in texture or fast motion. Weight it by the inverse of the local variance of the original MB, or by the proxy's static mask.
+- **Budget per repair task** (one IDR period of the new stream; merged periods are one task): β × (bytes of the pictures dropped in it).
+  - Dropped picture sizes are in the headers: sum `slices[..].size` of the original pictures.
+  - Start with β ≈ 0.5. Unspent budget may carry over, but tasks run in parallel, so per-task budgets are simpler.
+- **Spend worst-first by a visibility score,** not raw max difference:
+  - **Propagation:** an error in a reference picture lives until the next IDR. Weight it by the pictures decoded after it in the period, or by the downstream error measured last round.
+  - **Masking:** drift in flat or static areas is far more visible than in texture or motion. Weight it by the inverse local variance of the original MB.
   - **Luma over chroma.**
-- **Floor:** stop below a difference of about 3-4 levels whatever the budget. Below that, the kept twin is as faithful to the source as the original was; it's just a different encode.
-- **Report** budget, spend and leftover per period, and the distribution of remaining differences, so the owner can review the trade-off in `review/index.html`.
+- **Floor:** stop below about 3-4 levels whatever the budget. Below that, the kept twin is as faithful to the source as the original was.
+- **Keep a per-picture cap** in some form. It bounds the work per round, and a picture that needs more than a few percent of PCM is better served by idea 2.
+- **Cost:** PCM is about 400 bytes per MB. Measure the actual cost from the patch stats rather than assuming it.
+- **Report** budget, spend and leftover per period, plus the distribution of remaining differences. `--mb-report` already exports every differing MB.
 
-With I_PCM as the only currency (about 400 bytes per MB), even the full budget only takes the threshold from 16 to roughly 10-12 on busy content. Lowering it to 8 would cost about 70 MB per 5 minutes, about 3× the room. Idea 2 is what makes a low floor affordable.
+With PCM as the only currency, even the full budget only takes the threshold from 16 to roughly 10-12 on busy content. Step 2 is what makes a low floor affordable. Step 1 is still worth doing first: it is small, it puts the scoring and reporting in place, and step 2 slots into it as a cheaper kind of patch.
 
-### 2. Cheaper patches: residual corrections from our own pre-deblock reconstruction
+## Step 2: residual corrections
 
-Keep the MB's mode and motion and add a correction to its residual instead of replacing it with PCM. For an inter MB at QP q:
+The idea: keep the MB's mode and motion, and add a correction to its residual instead of replacing it with PCM.
+
+### The formulation (simpler than it first looks)
+
+For an inter MB at QP q in a picture that reads K where it read D:
 
 ```
-target  = original pre-deblock reconstruction of the MB
-pred'   = its prediction in the new stream (it reads K where it read D)
-R'      = target - pred' = original residual + (orig_pred - pred')
-levels' = quantise(forward_transform(R'), q)
+orig recon = clip(orig_pred + r),   r = residual from the original coefficients c
+new recon  = clip(new_pred + r'),   want r' ≈ r + (orig_pred - new_pred)
 ```
 
-`original residual` is exactly representable: it is the original coefficients, dequantised. So only the drift term `orig_pred - pred'` is quantised. The leftover error is a fraction of the quantiser step: about ±1-3 levels at the QPs seen here, compared with up to 15 today. A correction MB should cost tens of bytes, compared with about 400 for PCM.
+- The dequantiser and inverse transform are linear in the levels (up to the small rounding in dequantisation at low QP).
+- So the correction can be made **in the coefficient domain**: `levels' = c + quantise(forward_transform(orig_pred - new_pred), q)`.
+- Only the drift term is quantised, so the leftover error is a fraction of the quantiser step: about ±1-3 levels, against up to 15 today. A correction should cost tens of bytes, against about 400 for PCM.
 
-**The key fact that makes this feasible: no deblocking filter is needed.**
-- References are stored after deblocking, and ffmpeg already gives us those frames in the measure loop, for both the original and the new stream.
-- Pre-deblock reconstruction of picture N therefore needs only:
-  - inter prediction from the ffmpeg frames: luma 6-tap quarter-pel, chroma eighth-pel bilinear, default / explicit / implicit weighting;
-  - intra prediction from the pre-deblock pixels of picture N's own neighbouring MBs, which we reconstruct ourselves (4x4, 8x8 with reference filtering, 16x16, chroma);
-  - inverse transforms and dequantisation: 4x4, 8x8, Intra16x16 luma DC Hadamard, chroma 2x2 DC; flat or custom scaling lists; chroma QP from `chroma_qp_offset` (−3 on the Amazon file) and the QP table.
-- The measure loop already handles whatever deblocking does afterwards: decode, compare, patch again.
+This needs **no intra prediction, no full picture reconstruction and no deblocking filter**:
+- **Both predictions come from frames ffmpeg already gives us** in the measure loop. References are stored after deblocking, and that is exactly what motion compensation reads.
+  - `orig_pred` uses the original decode's frames and the original motion.
+  - `new_pred` uses the new stream's decoded frames and the same motion.
+- **Motion** comes from `mv::derive_motion`: per-4x4 ref indices, reference pictures and mvs, temporal and spatial direct included. It was validated bit-exact.
+- **Intra MBs** never read D directly; they only drift through drifted neighbours. Let them fall back to PCM.
 
-**A cheap, exact validation trick for the reconstruction:**
-- Rewrite one picture's slice header with `disable_deblocking_filter_idc = 1`. `explicit.rewrite_slice` already rebuilds headers bit by bit; extend it with that field.
-- Decode that segment with ffmpeg. Picture N then comes out *pre-deblock*, while every picture before it is unchanged.
-- Our reconstruction of N must match it bit for bit.
-- Do this for hundreds of pictures on all four test files (all MB types, both encoders) before relying on it.
+### What to build (new module, e.g. `src/recon.rs`)
 
-Pieces already there:
-- `h264cabac.py` parses and re-encodes every syntax element, coefficients included (`mb['coef']`, `cbp`, `t8`, `qpd`, intra modes `ipred` / `imodes`, `cmode`, `i16pred`).
-- `h264mv.derive_motion` gives per-4x4 reference indices, pictures and motion vectors, temporal and spatial direct included. These were validated bit-exact by re-expressing motion.
-- `patch.py` keeps the rest of a picture exact around a modified MB: skips that must become explicit, mvd re-solving, the QP chain, and direct blocks.
+1. **Inter prediction:**
+   - luma 6-tap quarter-pel (8.4.2.2.1);
+   - chroma eighth-pel bilinear (8.4.2.2.2);
+   - partitions down to 4x4;
+   - bi-prediction averaging;
+   - weighted prediction. **The Amazon PPS has `weighted_pred = 1` (explicit P weights) and `weighted_bipred_idc = 2` (implicit B weights from POC distances, 8.4.2.3).**
+2. **Explicit weight tables.** `h264hdr::parse_slice` (around `src/h264hdr.rs:595`) parses `pred_weight_table` but throws the values away. Store `luma_log2_weight_denom`, `chroma_log2_weight_denom` and the per-reference weights and offsets on the slice header.
+3. **Forward 4x4 / 8x8 integer transforms and a quantiser** at the MB's QP. Use plain rounding first, and trellis only if bytes matter. Inter MBs use luma 4x4 or 8x8 (no Hadamard) and chroma 2x2 DC plus 4x4 AC. Chroma QP comes from `chroma_qp_offset` (−3 on the Amazon file) and the QP table. Scaling lists are flat on all four test files (`scaling_matrix: 0`), but fail loudly if not.
+4. **Writing a correction into the CABAC record** (`records::Mb`: `coef` (`Coefs`: `l4`, `l8`, `cdc`, `cac`), `cbp`, `t8`, `qpd`, `dc_c`, `skip`, `direct16`):
+   - Recompute `cbp` and the coded-block flags from the new coefficients. Check how `src/cabac.rs` decides what to write.
+   - **P_Skip** becomes explicit P_L0_16x16 with the same motion. `patch::to_explicit` does this and re-solves the mvd.
+   - **B_Skip** becomes B_Direct_16x16 with residual; its derived motion is unchanged.
+   - **Transform size:** if the MB had no luma residual, `t8` was not coded. Choosing 4x4 is always legal; 8x8 has constraints on sub-partitions and direct inference.
+   - **QP:** keep the MB's QP. A skip MB has QP = QPpred, so `qpd = 0` keeps it. If a correction ever takes cbp to 0, `qpd` stops being coded and the QP chain shifts. `patch.rs` already maintains the QP chain (`qp_carriers`), so route through it.
+   - Everything else in the picture stays exact around a modified MB through `patch::patch_pictures`: skips that must become explicit, mvd re-solving, direct blocks. Corrections should be a new kind of entry in its `patches` / `targets` alongside PCM, not a separate path.
+5. **In the measure loop,** try a correction first, then PCM if the MB is intra, or if a correction at q can't reach the floor. A second option before PCM is a correction at a lower QP via `mb_qp_delta`. Correct reference pictures first, in decode order, as today.
 
-Pieces missing:
-- **Explicit weight tables.** `h264hdr.parse_slice` reads `pred_weight_table` but discards the values. Record `luma_log2_weight_denom`, `chroma_log2_weight_denom` and the per-reference weights and offsets. Implicit weights follow from POCs (8.4.2.3).
-- **The reconstruction itself,** in the native extension from stage 1. Its records already hold modes, motion and coefficients, so reconstruction is just another picture-level operation (`pic.reconstruct(ctx, refs)`, where `refs` are the ffmpeg-decoded reference frames). A thin Python wrapper exposes the result as numpy arrays for tests.
-- **A forward transform and quantiser.** Use plain rounding first; trellis or RDO only if the byte cost matters.
-- **Putting a correction into the CABAC records:**
-  - set `cbp` and coefficients;
-  - a skip MB becomes an explicit MB with the same motion; `to_explicit` already does this;
-  - choose the transform size: keep `t8` unless 4x4 fits better;
-  - keep the MB's QP if at all possible, because QP also feeds the deblocking strength.
+### Validate the prediction before using it: the no-deblock trick
 
-Caveats to measure, not assume:
-- **Deblocking strength.** bS = 2 at an edge when either 4x4 block has non-zero coefficients. A correction that adds coefficients where there were none changes the filtering across that edge, a second-order error. The measure loop sees it, and the next round may correct it.
-- **Intra MBs** in affected pictures, and MBs whose error is too large for one correction at q, fall back to PCM. A second option is a correction at a lower QP via `mb_qp_delta`, which also changes the deblocking QP average at its edges.
-- **Corrections in reference pictures** stop propagation, just as PCM does today. Correct reference pictures first, in decode order.
-- **Exactness:** this approach is near-exact, not exact. That is fine per the owner: noise-level differences are acceptable, and visible substitutes are not.
+- Rewrite one picture's slice header with `disable_deblocking_filter_idc = 1`. `explicit::rewrite_slice` already rebuilds headers bit by bit; extend it with that field.
+- Decode the segment with ffmpeg. That picture comes out pre-deblock, and every picture before it is unchanged.
+- For MBs with cbp = 0, your `orig_pred` must equal the decoded MB bit for bit.
+- To check MBs with residual too, add the 4x4 / 8x8 inverse transform and dequantiser (about 150 lines) and compare `pred + residual`.
+- Do this on hundreds of pictures across all four test files (P, B, weighted, direct, both encoders) before relying on it.
+- Make it a `frame-dedup dev ...` command, as the other modules do (`src/dev.rs`).
 
-### 3. Optional: use corrections on the Canadian files too
+### Caveats to measure, not assume
 
-Their hard drops leave 1-8 levels around PCM patches from deblocking across PCM edges. With residual corrections, many of those MBs need no PCM at all. Run this only after ideas 1 and 2 work on the Amazon file, and compare with the v1.2.0 outputs (`work/*_out.mkv` and the reports).
+- **Deblocking strength:** an edge gets bS = 2 when either 4x4 block has coefficients. A correction that adds coefficients changes the filtering across that edge. This is a second-order error; the next measure round sees it.
+- **Clipping** at 0/255, and dequantisation rounding at low QP, make the linearity approximate. Again, the loop measures.
+- **Near-exact, not exact.** That is fine per the owner: noise-level differences are acceptable, and visible substitutes are not.
+
+## Step 3 (optional): corrections on the Canadian files
+
+Their exact repair leaves 1-8 levels around PCM patches from deblocking at PCM edges. With residual corrections, many of those MBs need no PCM at all. Only try this after steps 1 and 2 work on the Amazon file. Compare with the 2.0 outputs (`work/port/e2e/*.rs.mkv`, which are identical to v1.2.0).
+
+## Side idea, independent and small
+
+Drop rule 7, the "visible substitute", fires when an IDR-later pair can't be anchor-rebuilt. It drops a nearby real frame: a visible one-frame stutter next to a held frame.
+
+- Since 2.0.0 the planner has sync points at cuts and static frames.
+- So *keep both twins and trim at the next sync point* is usually better: one held frame, plus an invisible trim at a cut.
+- It costs up to about a frame of A/V offset until the cut. The owner's tolerance: 1 frame is fine, 2 feels weird, 3 is noticeable.
+- It only applies where a usable sync point is close (say within 2 s); keep rule 7 otherwise.
+- None of the test files hits rule 7 with default settings. `smoke.mkv --no-rebuild` gives 300 visible substitutes to test on. `--keep-idr-pairs` already keeps both everywhere: max offset 3.8 frames, verify clean.
 
 ## Practicalities
 
-- **Machine:** 32 threads and 31.7 GB of RAM, with a history of crashing under full load. Keep the defaults: half the workers, below-normal priority, and pools sized by `system.pool_size`. Explicit repair workers peaked at 1.1 GB (budget `REPAIR_PEAK_EXPLICIT` = 1.5 GB, so 9 workers). Run one heavy pipeline at a time.
-- **Speed:**
-  - Before stage 1, a repair period was dominated by the Python CABAC parse and encode (about 0.8 s per picture each way) and `derive_motion` (about 0.25 s).
-  - After stage 1, the ffmpeg decodes in the measure loop should dominate. Each round decodes the new period and, for memory, the original again.
-  - Frame diffs are cached across rounds, and pictures whose inputs didn't change are not re-encoded (`patch_pictures(cache=...)`).
-  - Residual corrections are reconstructed per affected MB only; reconstruct whole pictures only for validation.
-- **Test material:**
-  - The bitstream tests extract short clips from the MKVs in the repository root.
-  - `tests/test_explicit.py` covers explicit mode.
-  - `work/mmco/clip.mkv` (5 minutes) is a good iteration target: the full pipeline with `--verify` takes about 6 minutes.
-  - Work files from this session are in `work/mmco/`, including `t_norepair.py`, a visible-area error histogram between two Annex-B streams.
-- **Owner's preferences** (see the memory notes too):
+- **Machine:** 32 threads and 31.7 GB of RAM. It once crashed under full load (likely marginal RAM), so keep the defaults: half the workers, below-normal priority, pools sized by `system::pool_size`.
+  - Run **one heavy pipeline at a time.**
+  - The owner also uses this PC. **Ask before starting a long run** (the full Amazon file takes about 35 min) and stop when asked.
+- **Iteration targets:**
+  - `work/mmco/clip.mkv` (5 min, Amazon). The full pipeline with `--verify` takes about 1.5 min.
+  - `frame-dedup dev repair <scenario.json>` replays the repair stage alone from a recorded plan (drops, sigma, rebuilds). `work/port/oracle/full_scenario.json` is the full Amazon file. It has no per-period filter yet; adding one (for example, the worst capped periods such as 891 and 2006) is a cheap way to iterate on single periods.
+- **Measuring:**
+  - `--verify` reports per-frame and per-MB stats.
+  - `--mb-report mb.json --mb-threshold N` lists every differing MB with its location and severity.
+  - `review/` holds static HTML review pages. `.claude/launch.json` serves them with `python -m http.server`.
+  - The owner reviews results **by eye**: give before/after crops of the worst MBs (original, output, difference) for every change.
+- **Regression:** `pwsh tools/e2e.ps1 <names>` compares per-stream MD5s with reference outputs. Once repair changes on purpose, MD5s will differ on the Amazon files. The Canadian files must stay identical until step 3, and `verify.differing_outside_hard_neighbourhoods` must stay 0.
+- **Owner's preferences:**
   - Bit-exact wherever possible.
   - Noise-level differences confined to frames that read a substitute are acceptable.
-  - Visible substitutes are the worst outcome.
-  - The owner reviews results by eye; give them before/after crops of the worst MBs.
-
-## Full-length run (v1.2.0, `mmco-or-ref-list-modification.mkv`)
-
-### Plan (same in both runs)
-
-| | |
-|---|---|
-| input | 150,499 pictures at 29.97 fps, 2,511 IDR periods, 84 min |
-| cadence | 23.976, score 9.60, 10 phase changes (8 at black runs, 2 at hard cuts) |
-| duplicates | 30,100 |
-| drops | 30,098 → 120,401 frames out |
-| free reference drops (bit-exact) | 382 |
-| hard pairs | 2,716 |
-| anchor rebuilds (fallbacks) | 423 (0) |
-| substitutes | 13 invisible, **0 visible** |
-| unsupported pairs | 0 |
-| headers rewritten | 60,319; 423 IDRs demoted |
-| A/V | video − audio gap change +0.076 s. The two phase changes at hard cuts near the end have no black run after them to absorb the correction. Since 2.0.0 cuts are sync points too: one trim at the cut brings it to +0.034 s. |
-
-### First run: two defects, since fixed
-
-- **Status:** ok, 66 min (repair 46 min on 9 workers, verify 16 min).
-- **Verify:** 120,401 frames compared, 73,476 bit-exact. Nothing differs outside the hard-drop neighbourhoods and rebuilt leading pictures.
-- **Repair:** 105,731 PCM MBs, +39.8 MB on a 5.9 GB stream (0.7%).
-- **Defect 1, round cap:** 1,722 pictures stayed over the threshold, worst 169.
-  - The worst ones had **no patches and were not capped**.
-  - The loop patched one reference picture per round and stopped after 12 rounds.
-  - Anchor rebuilds **chain**: the IDR every 60 frames falls on a duplicate for a whole phase segment, so up to 18 consecutive IDR periods merge into one new period of up to 864 pictures. In such a period, 12 rounds don't reach the end.
-  - **Fix:** after `DRIFT_SEQUENTIAL_ROUNDS` = 6, every round patches everything still over the threshold.
-- **Defect 2, memory:** one repair worker peaked at **7.2 GB** (budget 1.5 GB).
-  - It held every original frame of a merged period, a second copy for the diff cache, and every parsed picture (25-45 MB each: records, bit list, motion).
-  - **Fix:**
-    - the original is decoded again in lockstep each round;
-    - only target frames of patched pictures are kept, and diffs are cached by hash;
-    - parsed pictures live in an LRU (`PARSED_CAP` = 12);
-    - parsed records keep only the header bits;
-    - motion is cached only for reference pictures;
-    - `patch_pictures` checks its cache *before* parsing, which matters with an LRU.
-- **Effect on period 891, which held the worst picture:** worst 169 → 17, 9 rounds (converged), PCM 441 → 1,041 MBs, 118 s → 267 s, worker memory growth about 100 MB.
-
-### Second run (with both fixes)
-
-| | |
-|---|---|
-| status | ok, 94 min (repair 79 min on 9 workers, verify 14 min) |
-| output | 5.59 GB MKV (input 6.04 GB); 120,401 frames at 23.976 |
-| verify | 73,476 bit-exact, 46,925 differ, **0 outside** hard-drop neighbourhoods and rebuilt leading pictures, 0 decoder errors |
-| repair | 149,483 PCM MBs, +56.2 MB (1.0% of the stream; the drops freed about 7% — see the clip numbers above) |
-| left over the threshold | 291 pictures, **all at the 2% PCM cap** (65 of them rebuilt leading pictures); visible worst 56 |
-| distribution of their worst MB | 16-23: 188, 24-31: 50, 32-39: 27, 40-47: 21, 48-56: 5 |
-| verify's worst (uncropped, so it includes the 8 hidden padding rows) | 103 |
-
-The 291 capped pictures are where a byte budget (idea 1) would spend first. Raising the cap alone would clear them at roughly 400 bytes per MB.
-
-**Memory after the fixes:**
-- The second run's workers still peaked at 3.5 GB.
-- In an 864-picture merged period, measured with full motion fields, that was:
-  - about 99 cached motion fields at 9.3 MB each;
-  - 12 parsed pictures at about 40 MB each;
-  - full target frames for every patched picture (3 MB each, hundreds).
-- Two more fixes followed:
-  - cached co-located motion is stored compactly (`h264mv.CompactMotion`, numpy-backed, 2.35 MB, equivalence checked);
-  - only the PCM samples of the MBs being patched are kept, not whole frames.
-- The real culprit turned out to be a leak: `derive_motion` stored every motion field on the picture dict it was given (`pic['motion'] = m`, never read). `patch_pictures` passes the task's own picture dicts, so each processed picture kept 9 MB forever. Removing it fixed most of the growth.
-- **Result**, measured in a spawned worker as the pipeline runs it:
-  - largest merged period (2006, 864 pictures): **1.0 GB** (first run: 7.2 GB);
-  - period 891: 0.72 GB;
-  - repair results identical (same PCM counts and rounds).
-- `sample.mkv` is still packet-identical to v1.1 and all tests pass.
-- The output in `work/mmco/full_out.mkv` comes from the second run. The later changes only affect memory, so a re-run gives the same repair.
+  - Visible artefacts and stutters are the worst outcome.
+  - Keep the README current: it documents every design decision and result.
