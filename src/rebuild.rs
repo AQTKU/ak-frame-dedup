@@ -13,7 +13,7 @@
 //! driver (`rebuild`, one task per pair, worker threads sharing the mapped
 //! streams).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -34,6 +34,7 @@ use crate::records::{Kind, Mb};
 use crate::reexpress::{has_direct, reexpress_compact};
 use crate::repair::{TmpFile, map_file, round1, run_pool};
 use crate::system::{FFMPEG_THREADS, REPAIR_PEAK, pool_size};
+use crate::recon::{Frame, add_residual, correct, predict_mb, residual};
 use crate::verify::mb_maxdiff;
 
 /// sei_message: payloadType 6 (recovery point), payloadSize 1,
@@ -52,6 +53,12 @@ pub const PCM_THRESHOLD: u32 = 16;
 /// most of the picture; there the motion masks the remaining differences.
 pub const PCM_MAX_FRACTION: f64 = 0.02;
 pub const MAX_ROUNDS: usize = 4;
+/// Rounds with residual corrections (B1-B3 are not references: corrections
+/// do not interact, they only need a few rounds for deblocking).
+pub const MAX_ROUNDS_CORR: usize = 8;
+/// With corrections, a correction is retried this often before an MB over
+/// [`PCM_THRESHOLD`] gets I_PCM.
+const CORR_MAX_TRIES: u8 = 3;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -76,6 +83,8 @@ struct Ctx<'a> {
     orig_of_src: &'a [usize],
     rebuilds: &'a [Rebuild],
     work: &'a Path,
+    /// Residual corrections for MBs off by this much or more (None: I_PCM only).
+    corr: Option<u8>,
 }
 
 /// Statistics of one leading picture (Python's `stats[b]` dict).
@@ -88,6 +97,7 @@ struct BStat {
     skip_explicit: usize,
     qp_carrier: usize,
     pcm: usize,
+    corrected: usize,
     bytes_after: usize,
     worst: u32,
     mbs_ge3: usize,
@@ -103,7 +113,7 @@ impl BStat {
         serde_json::json!({
             "src_dec": self.src_dec, "display_in": self.display_in, "direct_explicit": self.direct_explicit,
             "bytes_before": self.bytes_before, "skip_explicit": self.skip_explicit, "qp_carrier": self.qp_carrier,
-            "pcm": self.pcm, "bytes_after": self.bytes_after, "worst": self.worst, "mbs_ge3": self.mbs_ge3,
+            "pcm": self.pcm, "corrected": self.corrected, "bytes_after": self.bytes_after, "worst": self.worst, "mbs_ge3": self.mbs_ge3,
             "mbs_diff": self.mbs_diff, "worst_luma": self.worst_luma, "mbs_ge3_luma": self.mbs_ge3_luma,
             "rounds": self.rounds, "pcm_capped": self.pcm_capped,
         })
@@ -127,6 +137,7 @@ fn build_b(
     base: &[Mb],
     m0: &Motion,
     pcm: &BTreeSet<(u16, u16)>,
+    corr: &HashMap<(u16, u16), CorrFix>,
     yuv: &[u8],
     pics: &[Picture],
     intra: &Motion,
@@ -134,17 +145,20 @@ fn build_b(
     h: usize,
 ) -> Result<(Vec<Mb>, usize, usize)> {
     let mut new: Vec<Mb> = base.to_vec();
-    for mb in new.iter_mut() {
-        if pcm.contains(&(mb.x, mb.y)) {
-            let (x, y) = (mb.x, mb.y);
+    let qp = pic.slices[0].qp;
+    let mut target_qp = qp_chain(&dd.mbs, qp);
+    for (i, mb) in new.iter_mut().enumerate() {
+        let (x, y) = (mb.x, mb.y);
+        if pcm.contains(&(x, y)) {
             let mut r = pcm_record(yuv, w, x as usize, y as usize);
             r.x = x;
             r.y = y;
             *mb = r;
+        } else if let Some(c) = corr.get(&(x, y)) {
+            *mb = c.mb.clone();
+            target_qp[i] = c.qp;
         }
     }
-    let qp = pic.slices[0].qp;
-    let target_qp = qp_chain(&dd.mbs, qp);
     let (mut pred, mut n_skip) = (qp, 0usize);
     for (i, mb) in new.iter_mut().enumerate() {
         if mb.kind == Kind::Pcm {
@@ -170,7 +184,24 @@ fn build_b(
     Ok((new, n_skip, forced))
 }
 
+/// A corrected B1-B3 macroblock: its record, luma QP and how often it was
+/// corrected.
+#[derive(Clone, Debug)]
+struct CorrFix {
+    mb: Mb,
+    qp: i32,
+    tries: u8,
+}
+
 /// Re-encode B1-B3 of one rebuild. Returns their NALs and statistics.
+///
+/// With corrections (`cx.corr`), MBs off by the correction threshold get a
+/// residual correction: the target is B's original pre-deblocking
+/// reconstruction (its motion over the original references, K included)
+/// plus the difference in what deblocking does to it in the original and in
+/// the current decode; the prediction is the same motion over the rebuilt
+/// stream, where I2 stands in K's slot. I_PCM is left for MBs over
+/// [`PCM_THRESHOLD`] that no correction fixes.
 fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
     let t0 = Instant::now();
     let sps = cx.spss.get(&0).ok_or_else(|| anyhow!("KeyError: 0 (no SPS with id 0)"))?;
@@ -214,26 +245,34 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
     }
     drop(dk);
 
-    // original pixels of B1-B3
+    // original pixels of B1-B3 (and, for corrections, of their references)
     let orig_poc: Vec<i32> = bs.iter().map(|&b| cx.orig_pics[cx.orig_of_src[b]].poc).collect();
-    let want: BTreeSet<i32> = orig_poc.iter().copied().collect();
+    let ref_pics: BTreeSet<usize> = bs.iter().flat_map(|&b| src[b].lists.iter().flatten().copied()).collect();
+    let mut want: BTreeSet<i32> = orig_poc.iter().copied().collect();
+    if cx.corr.is_some() {
+        want.extend(ref_pics.iter().map(|&r| cx.orig_pics[cx.orig_of_src[r]].poc));
+    }
     let frames = decode_pocs(cx.orig_es, cx.orig_pics, task.orig_first, task.orig_last + 1, &want, fs, FFMPEG_THREADS)?;
     let target: Vec<&Vec<u8>> = orig_poc.iter().map(|p| frames.get(p).ok_or_else(|| anyhow!("KeyError: {p}"))).collect::<Result<_>>()?;
 
     let tmp = TmpFile(cx.work.join(format!("rebuild_{k}.h264")));
     let mut pcm: Vec<BTreeSet<(u16, u16)>> = vec![BTreeSet::new(); bs.len()];
+    let mut corr: Vec<HashMap<(u16, u16), CorrFix>> = vec![HashMap::new(); bs.len()];
+    let mut settled: Vec<HashSet<(u16, u16)>> = vec![HashSet::new(); bs.len()];
     let budget = (PCM_MAX_FRACTION * w as f64 * h as f64) as usize;
     let seg = &src[task.seg.clone()];
     let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
-    for rnd in 0..MAX_ROUNDS {
+    let max_rounds = if cx.corr.is_some() { MAX_ROUNDS_CORR } else { MAX_ROUNDS };
+    for rnd in 0..max_rounds {
         repl.clear();
         for (i, &b) in bs.iter().enumerate() {
             let (dd, base, m0) = &recs[i];
-            let (mut new, n_skip, forced) = build_b(&src[b], dd, base, m0, &pcm[i], target[i], src, &intra, w, h)?;
+            let (mut new, n_skip, forced) = build_b(&src[b], dd, base, m0, &pcm[i], &corr[i], target[i], src, &intra, w, h)?;
             let nal = try_encode_picture(dd, cx.spss, cx.ppss, &mut new).with_context(|| format!("dec {b}"))?;
             stats[i].skip_explicit = n_skip;
             stats[i].qp_carrier = forced;
             stats[i].pcm = pcm[i].len();
+            stats[i].corrected = corr[i].len();
             stats[i].bytes_after = nal.len();
             repl.insert(b, nal);
         }
@@ -249,17 +288,71 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
                 if !it.next_frame(&mut fr)? {
                     break;
                 }
-                if bs.contains(&dec) {
+                // B1-B3, and for corrections the frames they read (I2 for K)
+                if bs.contains(&dec) || (cx.corr.is_some() && (dec == r.d || ref_pics.contains(&dec))) {
                     got.insert(dec, fr.clone());
                 }
             }
         }
-        if got.len() != bs.len() || !bs.iter().all(|b| got.contains_key(b)) {
+        if !bs.iter().all(|b| got.contains_key(b)) {
             bail!("AssertionError: segment decode lost a leading picture");
         }
         let mut grew = false;
+        let last = rnd + 1 == max_rounds;
         for (i, &b) in bs.iter().enumerate() {
             let (m, ly) = mb_maxdiff(&got[&b], target[i], w, h);
+            let mut fresh: HashSet<(u16, u16)> = HashSet::new();
+            if let (Some(thr), false) = (cx.corr, last) {
+                let (dd, base, m0) = &recs[i];
+                let mut cands: Vec<(u8, u16, u16)> = Vec::new();
+                for (j, &v) in m.iter().enumerate() {
+                    let (x, y) = ((j % w) as u16, (j / w) as u16);
+                    let keep_settled = settled[i].contains(&(x, y)) && (v as u32) < PCM_THRESHOLD;
+                    if v >= thr && !pcm[i].contains(&(x, y)) && !keep_settled && !dd.mbs[j].intra {
+                        cands.push((v, x, y));
+                    }
+                }
+                if !cands.is_empty() {
+                    let pps = cx.ppss.get(&dd.sl.pps_id).ok_or_else(|| anyhow!("KeyError: pps {}", dd.sl.pps_id))?;
+                    let qps = qp_chain(&dd.mbs, dd.sl.qp);
+                    let orig_ref = |r: usize| frames.get(&cx.orig_pics[cx.orig_of_src[r]].poc).map(|f| Frame::new(f, sps));
+                    let rd = r.d;
+                    let new_ref = |p: usize| got.get(&if p == k { rd } else { p }).map(|f| Frame::new(f, sps));
+                    let max_err = (thr / 2).max(3);
+                    for (v, x, y) in cands {
+                        let j = y as usize * w + x as usize;
+                        let (bx, by) = (x as usize, y as usize);
+                        let (cur, cqp, tries) = match corr[i].get(&(x, y)) {
+                            Some(c) => (c.mb.clone(), c.qp, c.tries),
+                            None => (base[j].clone(), qps[j], 0),
+                        };
+                        let opred = predict_mb(pps, &src[b], src, m0, bx, by, &orig_ref)?;
+                        let pre_orig = add_residual(&opred, &residual(&dd.mbs[j], qps[j], pps)?);
+                        let npred = predict_mb(pps, &src[b], src, m0, bx, by, &new_ref)?;
+                        let pre_now = add_residual(&npred, &residual(&cur, cqp, pps)?);
+                        let now = Frame::new(&got[&b], sps).mb(bx, by);
+                        let post = Frame::new(target[i], sps).mb(bx, by);
+                        let tgt: [u8; 384] = std::array::from_fn(|q| {
+                            let deb = (post[q] as i32 - pre_orig[q] as i32) - (now[q] as i32 - pre_now[q] as i32);
+                            (pre_orig[q] as i32 + deb).clamp(0, 255) as u8
+                        });
+                        let c = correct(&cur, cqp, pps, &npred, &tgt, max_err).with_context(|| format!("dec {b} MB ({x}, {y})"))?;
+                        let unchanged = c.mb == cur && c.qp == cqp;
+                        if std::env::var_os("FD_CORR_DEBUG").is_some() {
+                            let d = |a: &[u8; 384], b: &[u8; 384]| a.iter().zip(b).map(|(p, q)| p.abs_diff(*q)).max().unwrap_or(0);
+                            eprintln!("RB k {k} b {b} rnd {rnd} ({x},{y}) v {v} | opred-npred {} pre_orig-post {} pre_now-now {} pre_orig-pre_now {} -> err {} qp {}->{} tries {tries}",
+                                      d(&opred, &npred), d(&pre_orig, &post), d(&pre_now, &now), d(&pre_orig, &pre_now), c.err, cqp, c.qp);
+                        }
+                        if c.err <= max_err && tries < CORR_MAX_TRIES && !unchanged {
+                            corr[i].insert((x, y), CorrFix { mb: c.mb, qp: c.qp, tries: tries + 1 });
+                            fresh.insert((x, y));
+                            grew = true;
+                        } else if (v as u32) < PCM_THRESHOLD {
+                            settled[i].insert((x, y));
+                        }
+                    }
+                }
+            }
             let st = &mut stats[i];
             st.worst = m.iter().copied().max().unwrap_or(0) as u32;
             st.mbs_ge3 = m.iter().filter(|&&v| v >= 3).count();
@@ -271,7 +364,9 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
             for (j, &v) in m.iter().enumerate() {
                 if v as u32 >= PCM_THRESHOLD {
                     let (x, y) = ((j % w) as u16, (j / w) as u16);
-                    if !pcm[i].contains(&(x, y)) {
+                    // with corrections, I_PCM only where no correction was
+                    // made this round
+                    if !pcm[i].contains(&(x, y)) && !fresh.contains(&(x, y)) {
                         more.push((v, x, y));
                     }
                 }
@@ -280,7 +375,10 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
             let room = budget as i64 - pcm[i].len() as i64;
             st.pcm_capped = more.len() as i64 > room;
             if !more.is_empty() && room > 0 {
-                pcm[i].extend(more.iter().take(room as usize).map(|&(_, x, y)| (x, y)));
+                for &(_, x, y) in more.iter().take(room as usize) {
+                    pcm[i].insert((x, y));
+                    corr[i].remove(&(x, y));
+                }
                 grew = true;
             }
         }
@@ -311,6 +409,7 @@ pub fn rebuild(
     workers: usize,
     work: &Path,
     log: &crate::system::Logger,
+    corr: Option<u8>,
 ) -> Result<(Vec<usize>, serde_json::Value)> {
     let t0 = Instant::now();
     let chk = check_lists(spss, src_pics, 0, rebuilds)?;
@@ -339,7 +438,7 @@ pub fn rebuild(
     let mut results: Vec<TaskResult> = Vec::new();
     if !tasks.is_empty() {
         let src_map = map_file(src_es)?;
-        let cx = Ctx { orig_es, src_es, src_map: &src_map, spss, ppss, orig_pics, src_pics, orig_of_src, rebuilds, work };
+        let cx = Ctx { orig_es, src_es, src_map: &src_map, spss, ppss, orig_pics, src_pics, orig_of_src, rebuilds, work, corr };
         let idx: Vec<(usize, &Task)> = tasks.iter().enumerate().collect();
         let n = tasks.len();
         let work_fn = |t: &(usize, &Task)| run_task(&cx, t.0, t.1);
@@ -933,7 +1032,7 @@ pub fn dev_rebuild(args: &[String]) -> Result<()> {
         bail!("the source stream has {} pictures, the scenario maps {}", src_pics.len(), src_orig.len());
     }
     let t0 = Instant::now();
-    let (orig_of_out, rb) = rebuild(&orig_es, &src_es, Path::new(&out), &nspss, &nppss, &orig_pics, &src_pics, &src_orig, &rbs, workers, &work, &log)?;
+    let (orig_of_out, rb) = rebuild(&orig_es, &src_es, Path::new(&out), &nspss, &nppss, &orig_pics, &src_pics, &src_orig, &rbs, workers, &work, &log, None)?;
     let secs = t0.elapsed().as_secs_f64();
     if let Some(r) = &report {
         std::fs::write(r, crate::records::canonical_text(&json!({"anchor_rebuilds": rb, "orig_of_out": orig_of_out, "wall_seconds": secs})))?;

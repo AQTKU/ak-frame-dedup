@@ -741,6 +741,7 @@ impl Run {
             let rb_es = self.work.join("rebuilt.h264");
             let (o, rb) = rebuild::rebuild(
                 &ld.es, &out_es, &rb_es, &nspss, &nppss, &ld.pics, &src_pics, &src_orig, &rbs, self.workers, &self.work, &self.log,
+                if self.a.drift_corrections { Some(self.a.drift_threshold) } else { None },
             )?;
             orig_of_out = o;
             self.log(&format!(
