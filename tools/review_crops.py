@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image
 
 W, H = 1920, 1080
-CROP, ZOOM, GAIN = 96, 4, 8
+CROP, ZOOM, GAIN = 96, 3, 8
 
 
 def frame(path, n):
@@ -56,20 +56,20 @@ def main():
         cy = min(max(my * 16 + 8 - CROP // 2, 0), H - CROP)
         o = frame(orig, fin)[cy:cy + CROP, cx:cx + CROP]
         save(o, out_dir / f"{k}_orig.png")
-        cells = [f"<td><img src='{k}_orig.png'><br>original</td>"]
+        cells = [f"<figure><img src='{k}_orig.png'><figcaption>original</figcaption></figure>"]
         for label, path in outs:
             a = frame(path, fout)[cy:cy + CROP, cx:cx + CROP]
             d = a.astype(int) - o.astype(int)
             save(a, out_dir / f"{k}_{label}.png")
             save(np.clip(128 + GAIN * d, 0, 255).astype(np.uint8), out_dir / f"{k}_{label}_diff.png")
-            cells.append(f"<td><img src='{k}_{label}.png'><br>{label} (max |d| {abs(d).max()})</td>")
-            cells.append(f"<td><img src='{k}_{label}_diff.png'><br>{label} diff x{GAIN}</td>")
+            cells.append(f"<figure><img src='{k}_{label}.png'><figcaption>{label} (max |d| {abs(d).max()})</figcaption></figure>")
+            cells.append(f"<figure><img src='{k}_{label}_diff.png'><figcaption>{label} diff x{GAIN}</figcaption></figure>")
         rows.append(f"<h3>#{k}: output frame {fout} (input {fin}, {typ}), MB ({mx}, {my}), "
-                    f"luma off by {lum} in the first output</h3><table><tr>{''.join(cells)}</tr></table>")
+                    f"luma off by {lum} in the first output</h3><div class=row>{''.join(cells)}</div>")
     (out_dir / "index.html").write_text(
         "<!doctype html><meta charset=utf-8><title>Worst macroblocks</title>"
-        "<style>body{font:14px sans-serif;background:#222;color:#ddd}td{text-align:center;padding:4px}"
-        "img{image-rendering:pixelated}</style>" + "".join(rows), encoding="utf-8")
+        "<style>body{font:14px sans-serif;background:#222;color:#ddd}.row{display:flex;flex-wrap:wrap;gap:6px}"
+        "figure{margin:0;text-align:center}img{image-rendering:pixelated;display:block}</style>" + "".join(rows), encoding="utf-8")
 
 
 if __name__ == "__main__":

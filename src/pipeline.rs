@@ -91,6 +91,10 @@ pub struct Args {
     /// explicit mode: repair inter MBs with residual corrections before I_PCM
     #[arg(long, hide = true)]
     pub drift_corrections: bool,
+    /// explicit mode with corrections: I_PCM only for MBs off by this much
+    /// (default: the drift threshold)
+    #[arg(long, hide = true)]
+    pub drift_pcm_threshold: Option<u8>,
 }
 
 /// No duplicate-frame cadence was found (exit code 2).
@@ -816,6 +820,7 @@ impl Run {
                         threshold: self.a.drift_threshold,
                         max_fraction: self.a.drift_cap,
                         corrections: self.a.drift_corrections,
+                        pcm_threshold: self.a.drift_pcm_threshold.unwrap_or(self.a.drift_threshold),
                     },
                 },
                 &self.log,

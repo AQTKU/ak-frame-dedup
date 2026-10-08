@@ -60,6 +60,9 @@ use crate::verify::{mb_maxdiff, visible_maxdiff};
 pub const DRIFT_THRESHOLD: u8 = 16;
 pub const DRIFT_MAX_FRACTION: f64 = 0.02;
 pub const DRIFT_MAX_ROUNDS: usize = 12;
+/// With corrections a round is cheap, and a long period with heavy drift
+/// needs more of them to settle.
+pub const DRIFT_MAX_ROUNDS_CORR: usize = 20;
 /// After these rounds, each round patches every picture still over.
 pub const DRIFT_SEQUENTIAL_ROUNDS: usize = 6;
 
@@ -72,11 +75,14 @@ pub struct Drift {
     pub max_fraction: f64,
     /// Repair inter MBs with residual corrections before falling back to I_PCM.
     pub corrections: bool,
+    /// With corrections: an MB no correction fixes gets I_PCM only from this
+    /// drift on (below it, it is left as it is).
+    pub pcm_threshold: u8,
 }
 
 impl Default for Drift {
     fn default() -> Self {
-        Drift { threshold: DRIFT_THRESHOLD, max_fraction: DRIFT_MAX_FRACTION, corrections: false }
+        Drift { threshold: DRIFT_THRESHOLD, max_fraction: DRIFT_MAX_FRACTION, corrections: false, pcm_threshold: DRIFT_THRESHOLD }
     }
 }
 
@@ -804,6 +810,9 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     // why MBs got I_PCM with corrections on: no correction (intra), error
     // too large, corrected too often, correction unchanged
     let mut pcm_why = [0usize; 4];
+    // MBs over the threshold that no correction fixes, left as they are while
+    // under the I_PCM threshold
+    let mut settled: HashSet<(usize, u16, u16)> = HashSet::new();
     let mut rounds = 0usize;
     let mut viol: BTreeMap<usize, Vec<(u8, u16, u16)>>;
     let mut res: PatchResult;
@@ -866,8 +875,10 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                 for (i, &v) in m.iter().enumerate() {
                     if v >= cx.drift.threshold {
                         let (x, y) = ((i % w) as u16, (i / w) as u16);
-                        // I_PCM is final; a corrected MB may be corrected again
-                        if !matches!(fixes.get(&(nd, x, y)), Some(Fix::Pcm(_))) {
+                        // I_PCM is final; a corrected MB may be corrected again;
+                        // a settled one only if it got worse
+                        let settled_ok = settled.contains(&(nd, x, y)) && v < cx.drift.pcm_threshold;
+                        if !matches!(fixes.get(&(nd, x, y)), Some(Fix::Pcm(_))) && !settled_ok {
                             bad.push((v, x, y));
                         }
                     }
@@ -946,9 +957,20 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         drop(refs);
         rounds += 1;
         let todo: Vec<usize> = viol.keys().copied().filter(|nd| !capped.contains(nd)).collect();
-        if todo.is_empty() || rounds > DRIFT_MAX_ROUNDS {
+        if std::env::var_os("FD_CORR_DEBUG").is_some() {
+            let nbad: usize = viol.values().map(Vec::len).sum();
+            let worst_bad = viol.values().flatten().map(|b| b.0).max().unwrap_or(0);
+            let n_corr = fixes.values().filter(|f| matches!(f, Fix::Corr(..))).count();
+            eprintln!("ROUND period {} round {rounds}: {} pictures, {nbad} MBs over (worst {worst_bad}); fixes: {} corrected, {} PCM, {} settled",
+                      task.period, viol.len(), n_corr, fixes.len() - n_corr, settled.len());
+        }
+        let max_rounds = if use_corr { DRIFT_MAX_ROUNDS_CORR } else { DRIFT_MAX_ROUNDS };
+        if todo.is_empty() || rounds > max_rounds {
             break;
         }
+        // the last round's fixes are not measured again: no corrections
+        // (their prediction of the references can be off), only I_PCM
+        let last = rounds == max_rounds;
         // early rounds patch in decode order up to the first reference
         // picture (what it fixes downstream is measured again next round);
         // later rounds patch everything still over the threshold
@@ -964,16 +986,15 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
             mbs.extend(v.iter().filter(|&&(_, x, y)| !fixes.contains_key(&(nd, x, y))).take(room.max(0) as usize).map(|&(_, x, y)| (x, y)));
             if !mbs.is_empty() {
                 let mut all: BTreeSet<(u16, u16)> = patches.get(&nd).map(|p| p.iter().copied().collect()).unwrap_or_default();
-                all.extend(mbs.iter().copied());
-                patches.insert(nd, all.into_iter().collect());
                 let kept = keep.get_mut(&nd).expect("kept samples for every violating picture");
                 let cs = corr.get(&nd);
+                let drift: HashMap<(u16, u16), u8> = v.iter().map(|&(d, x, y)| ((x, y), d)).collect();
                 for &(x, y) in &mbs {
                     let tries = match fixes.get(&(nd, x, y)) {
                         Some(Fix::Corr(_, _, n, _)) => *n,
                         _ => 0,
                     };
-                    let usable = cs.and_then(|c| c.get(&(x, y))).filter(|c| {
+                    let usable = cs.filter(|_| !last).and_then(|c| c.get(&(x, y))).filter(|c| {
                         let unchanged = match fixes.get(&(nd, x, y)) {
                             Some(Fix::Corr(m, _, _, q)) => **m == c.mb && *q == c.qp,
                             _ => false,
@@ -984,6 +1005,12 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                         Some(c) => {
                             version += 1;
                             Fix::Corr(Box::new(c.mb.clone()), version, tries + 1, c.qp)
+                        }
+                        None if use_corr && !last && drift[&(x, y)] < cx.drift.pcm_threshold => {
+                            // not worth an I_PCM: leave it (and its last
+                            // correction, if any) unless it gets worse
+                            settled.insert((nd, x, y));
+                            continue;
                         }
                         None => {
                             if use_corr {
@@ -999,7 +1026,9 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                         }
                     };
                     fixes.insert((nd, x, y), fix);
+                    all.insert((x, y));
                 }
+                patches.insert(nd, all.into_iter().collect());
             }
             if new_pics[nd].ref_idc != 0 && rounds <= DRIFT_SEQUENTIAL_ROUNDS && !use_corr {
                 break;
