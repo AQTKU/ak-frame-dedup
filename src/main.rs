@@ -4,6 +4,11 @@ use clap::{CommandFactory, Parser, error::ErrorKind};
 
 use frame_dedup::{dev, pipeline, system};
 
+// The measured repair allocates millions of small vectors per picture from
+// many threads at once; mimalloc's per-thread heaps keep them from contending.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("dev") {

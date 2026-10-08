@@ -74,7 +74,8 @@ byte-identical output (see "Rust port" below). 2.1 repairs drift with
 residual corrections (see "Residual corrections"); `--no-corrections` gives
 2.0's output. 2.2 pools the byte budget across IDR periods, repairs the
 rebuilt leading B pictures from 8 levels, and makes the measured repair
-faster.
+faster; 2.2.1 uses the mimalloc allocator (same output, the full Amazon
+file in 41 minutes instead of 52).
 
 ## How it works
 
@@ -447,6 +448,10 @@ and QP; I_PCM is the fallback. A correction costs about 30-40 bytes.
   reconstruction). The refinement scores only the samples a level change
   touches. Long periods are started first. None of this changes the
   output.
+- **Allocator** (2.2.1). The binary uses mimalloc instead of the Windows
+  heap. A parsed picture is tens of thousands of small vectors, allocated
+  and freed by every repair worker at once; with per-thread heaps the
+  repair takes 21% less time on the clip and 27% less on the full file.
 
 What did not work, measured on the 5-minute Amazon clip at threshold 6 /
 I_PCM 8 unless noted (+11.8 MB, worst 12, as reference):
@@ -570,7 +575,7 @@ Amazon, 5-minute clip (the drops free 24.1 MB):
 | periods left over budget | 9 of 88 | 0 (9 repaired again with pooled shares) |
 | MBs off by ≥ 4 / 6 / 8 / 12 / 16 | 851,204 / 43,886 / 3 / 0 / 0 | 826,114 / 6,397 / 1 / 1 / 0 |
 | worst difference | 9 | 12 (one I_PCM macroblock) |
-| runtime (repair) | 185 s (139 s) | 175 s (136 s) |
+| runtime (repair) | 185 s (139 s) | 175 s (136 s); 2.2.1: 148 s (108 s) |
 
 Amazon, full file (the drops free 501 MB of 5,898 MB of video):
 
@@ -583,8 +588,8 @@ Amazon, full file (the drops free 501 MB of 5,898 MB of video):
 | worst difference | 38 | 38 (the same I_PCM macroblock) |
 | differing outside hard-drop neighbourhoods | 0 | 0 |
 | repair workers | 6 | 9 |
-| runtime (repair, verify) | 53.5 min (42, 8) | 52.0 min (41, 8) |
-| peak private memory | | 12.7 GB |
+| runtime (repair, verify) | 53.5 min (42, 8) | 52.0 min (41, 8); 2.2.1: 40.8 min (30, 8) |
+| peak private memory | | 12.7 GB; 2.2.1: 12.4 GB |
 
 smoke.mkv, the leading B pictures of its 300 anchor rebuilds:
 
@@ -605,7 +610,9 @@ tasks) are longer than the caches. On the clip the repair stays far from
 CPU-bound (35-45% of the machine with 9 workers), but each worker gets
 slower as workers are added (about 35% from 6 to 9), which points at
 contention in memory allocation: a parsed picture is tens of thousands of
-small allocations.
+small allocations. 2.2.1 switches the allocator to mimalloc, which cuts the
+repair from 41 to 30 minutes on the full file (136 to 108 s on the clip)
+with identical output.
 
 ### Version 2.1: residual corrections
 
@@ -822,7 +829,7 @@ given only the raw output stream with no `--default-duration`, infers
   corrections"). With `--no-corrections`, as in 2.0: below 16, or above it
   where the 2% per-picture PCM cap ran out.
 - A correction costs the time of reconstructing macroblocks and of more
-  repair rounds: the full Amazon file takes 52 minutes instead of 2.0's
+  repair rounds: the full Amazon file takes 41 minutes instead of 2.0's
   34 (2.1: 54).
 - Hard drops in exact mode leave differences of 1-8 levels around the I_PCM
   patches. They come from deblocking across PCM edges, and from intra

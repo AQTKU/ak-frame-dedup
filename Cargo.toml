@@ -1,6 +1,6 @@
 [package]
 name = "frame-dedup"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2024"
 description = "Remove inserted duplicate frames from H.264 MKVs without re-encoding"
 publish = false
@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
