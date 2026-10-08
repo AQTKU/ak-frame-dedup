@@ -26,6 +26,9 @@ pub const RAM_FRACTION: f64 = 0.40;
 pub const REPAIR_PEAK: f64 = 0.8e9;
 /// Explicit-mode repair worker (holds a whole IDR period's frames).
 pub const REPAIR_PEAK_EXPLICIT: f64 = 1.5e9;
+/// Per-worker peak of the measured repair with residual corrections: it also
+/// keeps reference frames, corrected records and their target samples.
+pub const REPAIR_PEAK_CORR: f64 = 2.2e9;
 /// Budget per verify worker (measured peak ~235 MB).
 pub const VERIFY_PEAK: f64 = 0.5e9;
 

@@ -243,16 +243,43 @@ pub fn predict_mb<'a>(
     mby: usize,
     refs: &dyn Fn(usize) -> Option<Frame<'a>>,
 ) -> Result<[u8; 384]> {
+    let at = |gx: usize, gy: usize| -> Result<BlockMotion> {
+        let i = m.idx(gx, gy);
+        if m.intra[i] != 0 {
+            bail!("MB ({mbx}, {mby}) is intra");
+        }
+        Ok(BlockMotion { refidx: [m.refidx[0][i], m.refidx[1][i]], refpic: [m.refpic[0][i], m.refpic[1][i]], mv: [m.mv[0][i], m.mv[1][i]] })
+    };
+    predict_mb_with(pps, pic, pics, &at, mbx, mby, refs)
+}
+
+/// The motion of one 4x4 block: reference index, reference picture (decode
+/// index, -1 for none) and mv per list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockMotion {
+    pub refidx: [i8; 2],
+    pub refpic: [i32; 2],
+    pub mv: [[i16; 2]; 2],
+}
+
+/// [`predict_mb`] with the motion of each 4x4 block (absolute 4x4
+/// coordinates) given by `at`.
+pub fn predict_mb_with<'a>(
+    pps: &Pps,
+    pic: &Picture,
+    pics: &[Picture],
+    at: &dyn Fn(usize, usize) -> Result<BlockMotion>,
+    mbx: usize,
+    mby: usize,
+    refs: &dyn Fn(usize) -> Option<Frame<'a>>,
+) -> Result<[u8; 384]> {
     let mut out = [0u8; 384];
     for by in 0..4 {
         for bx in 0..4 {
             let (gx, gy) = (mbx * 4 + bx, mby * 4 + by);
-            let i = m.idx(gx, gy);
-            if m.intra[i] != 0 {
-                bail!("MB ({mbx}, {mby}) is intra");
-            }
-            let ri = [m.refidx[0][i], m.refidx[1][i]];
-            let rp = [m.refpic[0][i], m.refpic[1][i]];
+            let bm = at(gx, gy)?;
+            let ri = bm.refidx;
+            let rp = bm.refpic;
             let mut fr: [Option<Frame>; 2] = [None, None];
             for l in 0..2 {
                 if ri[l] >= 0 {
@@ -266,7 +293,7 @@ pub fn predict_mb<'a>(
                 bail!("MB ({mbx}, {mby}) block ({bx}, {by}) predicts from no list");
             }
             let wt = block_weights(pps, pic, pics, ri, rp)?;
-            let mv = [m.mv[0][i], m.mv[1][i]];
+            let mv = bm.mv;
             // luma 4x4
             for yy in 0..4 {
                 for xx in 0..4 {

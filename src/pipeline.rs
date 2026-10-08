@@ -95,6 +95,15 @@ pub struct Args {
     /// (default: the drift threshold)
     #[arg(long, hide = true)]
     pub drift_pcm_threshold: Option<u8>,
+    /// explicit mode with corrections: per-period byte budget as a fraction
+    /// of the bytes dropped from the period (0: none)
+    #[arg(long, default_value_t = 0.0, hide = true)]
+    pub drift_budget: f64,
+
+    /// use explicit reference control (and the measured repair) even when
+    /// the stream does not need it
+    #[arg(long, hide = true)]
+    pub force_explicit: bool,
 }
 
 /// No duplicate-frame cadence was found (exit code 2).
@@ -438,7 +447,7 @@ impl Run {
             time_scale: timing.time_scale,
         });
         self.rep.frames_in = Some(n);
-        let explicit = explicit::stream_is_explicit(&pics);
+        let explicit = explicit::stream_is_explicit(&pics) || self.a.force_explicit;
         self.rep.explicit_reference_control = Some(explicit);
         self.log(&format!(
             "{n} pictures, input rate {} fps ({fps_in}) from the SPS VUI, {} IDR periods",
@@ -821,6 +830,7 @@ impl Run {
                         max_fraction: self.a.drift_cap,
                         corrections: self.a.drift_corrections,
                         pcm_threshold: self.a.drift_pcm_threshold.unwrap_or(self.a.drift_threshold),
+                        budget: self.a.drift_budget,
                     },
                 },
                 &self.log,

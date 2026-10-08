@@ -464,19 +464,23 @@ pub fn patch_pictures(
             continue;
         }
         let pd = load(ctx, parsed, d)?;
-        let (dd, m0) = (&pd.dd, &*pd.motion);
+        let dd = &pd.dd;
+        let m0: &Motion = &pd.motion;
         if let Some(c) = col {
             let cp = load(ctx, parsed, c)?;
             new_motion.entry(c).or_insert_with(|| cp.motion.clone());
         }
         let mut new: Vec<Mb> = dd.mbs.iter().map(copy_mb).collect();
-        let n_corr = targets.iter().filter(|&&(x, y)| !targets_src.intra(d, x, y)).count();
+        let mut n_corr = 0usize;
         if !targets.is_empty() {
             for mb in new.iter_mut() {
                 if targets.contains(&(mb.x, mb.y)) {
                     let mut r = targets_src.pcm(d, mb.x, mb.y)?;
                     r.x = mb.x;
                     r.y = mb.y;
+                    if r.kind != Kind::Pcm {
+                        n_corr += 1;
+                    }
                     *mb = r;
                 }
             }

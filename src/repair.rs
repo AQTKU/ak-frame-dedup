@@ -47,7 +47,7 @@ use crate::recon::{Correction, Frame, add_residual, correct, predict_mb, residua
 use crate::records::Mb;
 use crate::picture::{Parsed, decode_picture};
 use crate::stream::{new_lists, period_ranges};
-use crate::system::{FFMPEG_THREADS, Logger, REPAIR_PEAK, REPAIR_PEAK_EXPLICIT, peak_rss, pool_size};
+use crate::system::{FFMPEG_THREADS, Logger, REPAIR_PEAK, REPAIR_PEAK_CORR, REPAIR_PEAK_EXPLICIT, peak_rss, pool_size};
 use crate::verify::{mb_maxdiff, visible_maxdiff};
 
 // Explicit mode (see explicit.rs) repairs by measurement: a dropped twin D
@@ -78,11 +78,15 @@ pub struct Drift {
     /// With corrections: an MB no correction fixes gets I_PCM only from this
     /// drift on (below it, it is left as it is).
     pub pcm_threshold: u8,
+    /// With corrections: a period that has added more than this times the
+    /// bytes of the pictures dropped from it only repairs MBs from
+    /// `pcm_threshold` on (0: no limit).
+    pub budget: f64,
 }
 
 impl Default for Drift {
     fn default() -> Self {
-        Drift { threshold: DRIFT_THRESHOLD, max_fraction: DRIFT_MAX_FRACTION, corrections: false, pcm_threshold: DRIFT_THRESHOLD }
+        Drift { threshold: DRIFT_THRESHOLD, max_fraction: DRIFT_MAX_FRACTION, corrections: false, pcm_threshold: DRIFT_THRESHOLD, budget: 0.0 }
     }
 }
 
@@ -435,6 +439,9 @@ struct TaskResult {
     seconds: f64,
     /// Measured repair with corrections: I_PCM fallbacks by reason.
     pcm_why: [usize; 4],
+    /// Measured repair: (bytes of the dropped pictures, bytes added, whether
+    /// the budget ran out).
+    budget: (usize, i64, bool),
 }
 
 /// A 128-bit hash of a frame (the seen-frame cache of the measured repair
@@ -567,7 +574,7 @@ impl Targets for FixTargets<'_> {
     }
     fn qp(&self, dec: usize, x: u16, y: u16) -> Option<i32> {
         match self.0.get(&(dec, x, y)) {
-            Some(Fix::Corr(.., q)) => Some(*q),
+            Some(Fix::Corr(_, _, _, q)) => Some(*q),
             _ => None,
         }
     }
@@ -730,7 +737,7 @@ fn corrections(
             continue;
         }
         let (base, bqp) = match fixes.get(&(nd, x, y)) {
-            Some(Fix::Corr(m, .., q)) => (&**m, *q),
+            Some(Fix::Corr(m, _, _, q)) => (&**m, *q),
             Some(Fix::Pcm(_)) => continue,
             None => (orig, qps[i]),
         };
@@ -752,7 +759,7 @@ fn corrections(
             let now = cur.iter().zip(&target).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
             let post = (0..384).map(|k| orig_post[k].abs_diff(now_s[k])).max().unwrap_or(0);
             let aim = (0..384).map(|k| target[k].abs_diff(pre_now[k])).max().unwrap_or(0);
-            let same = matches!(fixes.get(&(nd, x, y)), Some(Fix::Corr(m, .., q)) if **m == c.mb && *q == c.qp);
+            let same = matches!(fixes.get(&(nd, x, y)), Some(Fix::Corr(m, _, _, q)) if **m == c.mb && *q == c.qp);
             eprintln!("CORR nd {nd} ({x},{y}) {} skip {} qp {bqp} pred-target {pre} current {now} post {post} aim {aim} -> err {} at qp {} same {same} tried {}",
                       cx.new_pics[nd].typ().as_str(), base.skip, c.err, c.qp, matches!(fixes.get(&(nd, x, y)), Some(Fix::Corr(..))));
         }
@@ -783,6 +790,17 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     let (pics, new_pics, orig_of_new) = (cx.pics, cx.new_pics, cx.orig_of_new);
     let new_range = task.new.clone();
     let use_corr = cx.drift.corrections;
+    // the byte budget: a share of what dropping pictures freed in this period
+    let dropped_bytes: usize = task
+        .orig_periods
+        .iter()
+        .flat_map(|&g| cx.orig_ranges[g].clone())
+        .filter(|&d| cx.new_of[d] == NONE)
+        .map(|d| pics[d].slices.iter().map(|s| s.size).sum::<usize>())
+        .sum();
+    let budget_bytes = cx.drift.budget * dropped_bytes as f64;
+    let mut spent;
+    let mut over_budget = false;
 
     let force: BTreeSet<usize> = new_range
         .clone()
@@ -819,6 +837,12 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
     loop {
         let ctx = PatchCtx { es: cx.new_es, spss: cx.spss, ppss: cx.ppss, pics: new_pics, range: new_range.clone() };
         res = patch_pictures(&ctx, &patches, &FixTargets(&fixes), &mut store as &mut dyn ParsedStore, &force, Some(&mut cache), &mut |_| {})?;
+        spent = res.stats.values().map(|s| s.bytes_after as i64 - s.bytes_before as i64).sum();
+        if use_corr && cx.drift.budget > 0.0 && spent as f64 > budget_bytes {
+            over_budget = true;
+        }
+        // over budget: only what would otherwise get I_PCM
+        let threshold = if over_budget { cx.drift.pcm_threshold.max(cx.drift.threshold) } else { cx.drift.threshold };
         {
             let mut f = BufWriter::with_capacity(1 << 20, File::create(&tmp.0).with_context(|| format!("cannot create {}", tmp.0.display()))?);
             write_segment(cx.new_es, new_pics, new_range.start, new_range.end, &res.repl, &mut f)?;
@@ -873,7 +897,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
                 let m = &seen[&nd].1;
                 let mut bad: Vec<(u8, u16, u16)> = Vec::new();
                 for (i, &v) in m.iter().enumerate() {
-                    if v >= cx.drift.threshold {
+                    if v >= threshold {
                         let (x, y) = ((i % w) as u16, (i / w) as u16);
                         // I_PCM is final; a corrected MB may be corrected again;
                         // a settled one only if it got worse
@@ -1060,6 +1084,7 @@ fn run_task_explicit(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         patches: patches.iter().map(|(nd, v)| (*nd, v.len())).collect(),
         seconds: round1(t0.elapsed().as_secs_f64()),
         pcm_why,
+        budget: (dropped_bytes, spent, over_budget),
     })
 }
 
@@ -1186,6 +1211,7 @@ fn run_task_exact(cx: &Ctx, task: &Task) -> Result<TaskResult> {
         patches: patches.iter().map(|(nd, v)| (*nd, v.len())).collect(),
         seconds: round1(t0.elapsed().as_secs_f64()),
         pcm_why: [0; 4],
+        budget: (0, 0, false),
     })
 }
 
@@ -1209,7 +1235,7 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         }
         let (t, c) = build_tasks_explicit(pics, new_pics, oo, sigma)?;
         log.log(&format!("repair: {} pictures read a substituted twin, in {} IDR periods", c.len(), t.len()));
-        (tasks, cands, orig_of_new, peak) = (t, c, oo.to_vec(), REPAIR_PEAK_EXPLICIT);
+        (tasks, cands, orig_of_new, peak) = (t, c, oo.to_vec(), if a.drift.corrections { REPAIR_PEAK_CORR } else { REPAIR_PEAK_EXPLICIT });
     } else {
         let oon: Vec<usize> = pics.iter().map(|p| p.dec).filter(|d| !a.drop.contains(d)).collect();
         if oon.len() != new_pics.len() {
@@ -1248,10 +1274,12 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
         let n_tasks = tasks.len();
         let work = |t: &Task| if explicit { run_task_explicit(&cx, t) } else { run_task_exact(&cx, t) };
         results = run_pool(nproc, &tasks, &work, |i, r: &TaskResult| {
-            let n_pcm: usize = r.patches.values().sum();
+            let n_fixed: usize = r.patches.values().sum();
+            let n_corr: usize = r.stats.values().map(|s| s.corrected).sum();
+            let fixed = if n_corr > 0 { format!("{} PCM + {n_corr} corrected MBs", n_fixed - n_corr) } else { format!("{n_fixed} PCM MBs") };
             let rounds = r.rounds.map(|n| format!(", {n} rounds")).unwrap_or_default();
             log.log(&format!(
-                "  [{}/{}] IDR period {}: {} pictures rewritten, {n_pcm} PCM MBs ({:.1} s{rounds})",
+                "  [{}/{}] IDR period {}: {} pictures rewritten, {fixed} ({:.1} s{rounds})",
                 i + 1,
                 n_tasks,
                 r.period,
@@ -1307,6 +1335,15 @@ pub fn repair(a: &RepairArgs, log: &Logger) -> Result<(HashMap<usize, Vec<u8>>, 
                 acc
             });
             o.insert("pcm_reasons".into(), json!({"intra_or_uncomputed": w[0], "error": w[1], "tries": w[2], "unchanged": w[3]}));
+            o.insert("pcm_threshold".into(), json!(a.drift.pcm_threshold));
+            o.insert("budget".into(), json!(a.drift.budget));
+            o.insert("dropped_bytes".into(), json!(results.iter().map(|r| r.budget.0).sum::<usize>()));
+            o.insert("periods_over_budget".into(), json!(results.iter().filter(|r| r.budget.2).count()));
+            let per: Vec<Value> = results
+                .iter()
+                .map(|r| json!({"period": r.period, "dropped_bytes": r.budget.0, "added_bytes": r.budget.1, "over_budget": r.budget.2, "rounds": r.rounds}))
+                .collect();
+            o.insert("periods".into(), Value::Array(per));
         }
         o.insert("drift_max_per_picture".into(), json!(((a.drift.max_fraction * sps.mb_w as f64 * sps.mb_h as f64) as usize).max(1)));
         o.insert("seconds".into(), json!(round1(results.iter().map(|r| r.seconds).sum::<f64>())));
