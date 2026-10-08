@@ -262,7 +262,9 @@ fn run_task(cx: &Ctx, ri: usize, task: &Task) -> Result<TaskResult> {
     let mut pcm: Vec<BTreeSet<(u16, u16)>> = vec![BTreeSet::new(); bs.len()];
     let mut corr: Vec<HashMap<(u16, u16), CorrFix>> = vec![HashMap::new(); bs.len()];
     let mut settled: Vec<HashSet<(u16, u16)>> = vec![HashSet::new(); bs.len()];
-    let budget = (PCM_MAX_FRACTION * w as f64 * h as f64) as usize;
+    // with corrections, I_PCM is only for what no correction fixes: no cap
+    // (B1-B3 are not references; a picture that needs it is rare)
+    let budget = if cx.corr.is_some() { w * h } else { (PCM_MAX_FRACTION * w as f64 * h as f64) as usize };
     let seg = &src[task.seg.clone()];
     let mut repl: HashMap<usize, Vec<u8>> = HashMap::new();
     let max_rounds = if cx.corr.is_some() { MAX_ROUNDS_CORR } else { MAX_ROUNDS };
@@ -502,9 +504,12 @@ pub fn rebuild(
     let sps = spss.get(&0).ok_or_else(|| anyhow!("KeyError: 0 (no SPS with id 0)"))?;
     let summary = serde_json::json!({
         "pairs": pairs.len(), "leading_b_pictures": n_leading,
-        "pcm_threshold": PCM_THRESHOLD, "pcm_max_per_picture": (PCM_MAX_FRACTION * sps.mb_w as f64 * sps.mb_h as f64) as usize,
+        "pcm_threshold": PCM_THRESHOLD,
+        "pcm_max_per_picture": if corr.is_some() { sps.mb_w * sps.mb_h } else { (PCM_MAX_FRACTION * sps.mb_w as f64 * sps.mb_h as f64) as usize },
         "pictures_pcm_capped": n_capped_pairs, "pcm_mbs": pcm_total, "direct_explicit": direct_total,
         "bytes_added": bytes_total, "worst_in_leading_b": worst, "workers": nproc,
+        "corrected_mbs": results.iter().flat_map(|r| &r.stats).map(|s| s.corrected).sum::<usize>(),
+        "corr_threshold": corr,
         "worker_peak_rss_mb": (crate::system::peak_rss() as f64 / (1u64 << 20) as f64).round() as u64,
         "seconds": round1(t0.elapsed().as_secs_f64()), "pairs_detail": pairs,
     });
