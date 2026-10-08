@@ -36,7 +36,7 @@ frame-dedup in.mkv -o out.mkv [--report r.json] [--verify]
 | `--no-corrections` | repair drift with I_PCM only, as 2.0 did (see "Residual corrections") |
 | `--drift-threshold N` | measured repair: correct macroblocks off by N or more (default 6; 16 with `--no-corrections`) |
 | `--pcm-threshold N` | measured repair: I_PCM for macroblocks off by N or more that no correction fixes (default 8); below it they are left |
-| `--drift-budget F` | measured repair: once an IDR period has added F times the bytes dropped from it, repair only from `--pcm-threshold` on (default 1; 0: no budget) |
+| `--drift-budget F` | measured repair: may add up to F times the bytes dropped (default 1; 0: no budget). Each IDR period starts with F times its own dropped bytes; periods that run out are repaired again with a share of what the others left; where even that runs out, repair goes on only from `--pcm-threshold` |
 
 Exit codes:
 - 0: success.
@@ -72,7 +72,9 @@ Dev tools (`frame-dedup dev <command>`):
 The tool is a Rust port of the Python implementation (v1.2.0): 2.0 had
 byte-identical output (see "Rust port" below). 2.1 repairs drift with
 residual corrections (see "Residual corrections"); `--no-corrections` gives
-2.0's output.
+2.0's output. 2.2 pools the byte budget across IDR periods, repairs the
+rebuilt leading B pictures from 8 levels, and makes the measured repair
+faster.
 
 ## How it works
 
@@ -419,16 +421,32 @@ and QP; I_PCM is the fallback. A correction costs about 30-40 bytes.
     from `--pcm-threshold` (8) on; below it they are left as they are;
   - the last round makes no corrections, only I_PCM, since nothing measures
     it again; up to 20 rounds (most periods need 3-6);
-  - a per-period byte budget: once a period has added more than
-    `--drift-budget` (1.0) times the bytes of the pictures dropped from it,
-    it only repairs from the I_PCM threshold on;
+  - a pooled byte budget (`--drift-budget`, 1.0): the repair may add as
+    many bytes as the drops freed. Each period starts with its own dropped
+    bytes; one that runs out stops at once, and when all periods are done,
+    those that stopped are repaired again with an equal share of what the
+    others left (up to two such passes; the shares only depend on finished
+    passes, so the output does not depend on worker scheduling). Where even
+    that runs out, the last pass repairs only from the I_PCM threshold on.
+    Most periods free far more than they need; a few (fast motion, a long
+    period with few drops) need many times their own share;
   - reference frames are kept while a picture that reads them still has to
     be handled (pictures arrive in display order, references in decode
     order).
 - **Rebuilt pairs** (exact mode, `rebuild.rs`). The leading B pictures that
-  now read I2 instead of K get the same corrections from 8 levels on, with
-  I_PCM from 16 (no per-picture cap with corrections). They are not
-  references, so nothing propagates.
+  now read I2 instead of K get the same corrections from 8 levels on, and
+  I_PCM from 8 where no correction fixes a macroblock (2.1: from 16; no
+  per-picture cap with corrections). They are not references, so nothing
+  propagates.
+- **Speed** (2.2). Each round used to parse the period's pictures and decode
+  the original again. A task now keeps the parsed original pictures (24,
+  the first 16 for good: plain LRU over a period longer than its capacity
+  evicts every picture before it is read again) and, for tasks of up to 64
+  original pictures, the decoded original frames. The corrections keep what
+  they need of each original macroblock (record, QP, motion, pre-deblocking
+  reconstruction). The refinement scores only the samples a level change
+  touches. Long periods are started first. None of this changes the
+  output.
 
 What did not work, measured on the 5-minute Amazon clip at threshold 6 /
 I_PCM 8 unless noted (+11.8 MB, worst 12, as reference):
@@ -476,16 +494,21 @@ ffmpeg decoders once crashed a machine with marginal RAM.
   machine). Workers are threads of one process; they share the
   memory-mapped streams and the parsed headers.
 - Memory-heavy pools are sized so that workers × budget stays under 40% of
-  physical RAM, with the budgets measured for the Python implementation:
-  0.8 GB per repair worker, 1.5 GB per explicit-mode repair worker (9
-  workers on 31.7 GB), 2.2 GB per explicit-mode repair worker with
-  corrections (5 workers) and 0.5 GB per verify worker. The threads need much
-  less; the process peak on the full Amazon file was 6.7 GB, including the
-  pages of the two 6 GB streams it maps.
-- An explicit-mode repair task holds at most `PARSED_CAP` parsed pictures
-  and the co-located motion fields of reference pictures. It decodes the
-  original again each round instead of keeping it, and it keeps only the
-  PCM samples of the MBs it patches.
+  physical RAM: 0.8 GB per repair worker, 1.5 GB per explicit-mode repair
+  worker, with or without corrections (9 workers on 31.7 GB), and 0.5 GB
+  per verify worker. With corrections the budget is measured: about 1 GB
+  of private memory per worker on the 5-minute Amazon clip, 1.4 GB on the
+  full file (12.7 GB peak with 9 workers). The report gives the peak
+  private memory (`resources.main_peak_private_mb`) next to the peak
+  working set, which also counts the pages of the two memory-mapped
+  streams (6 GB each for the full Amazon file).
+- An explicit-mode repair task holds a bounded number of parsed pictures
+  (`PARSED_CAP`, 24 with corrections; 24 more parsed original pictures) and
+  the co-located motion fields of reference pictures. It keeps the decoded
+  original frames only when the task has at most 64 original pictures,
+  and otherwise decodes the original again each round. It keeps only the
+  samples of the MBs it patches. A parsed 1080p picture holds about 11 MB of
+  records and 2.6 MB of motion.
 - Each worker runs at most one full-resolution ffmpeg decoder at a time
   (explicit repair: the new and original decodes in lockstep), with 2
   threads. Verify hashes the original, then compares the output, then
@@ -531,6 +554,58 @@ derivation about 70× faster. What remains is mostly ffmpeg: the measured
 repair and the anchor rebuild decode every affected IDR period several
 times, and verify decodes everything twice.
 ## Results
+
+### Version 2.2: pooled budget, faster repair
+
+Default settings, `--verify`, 32-thread / 31.7 GB machine; counts as for
+2.1 below. sample.mkv and foliage.mkv are identical per stream to 2.1 (and
+1.2.0), nodupes.mkv exits with code 2, and `--no-corrections` still gives
+2.0's output (checked on the clip).
+
+Amazon, 5-minute clip (the drops free 24.1 MB):
+
+| | 2.1 | 2.2 |
+|---|---|---|
+| repair: bytes added | +9.6 MB (40% of the freed bytes) | +11.8 MB (49%) |
+| periods left over budget | 9 of 88 | 0 (9 repaired again with pooled shares) |
+| MBs off by ≥ 4 / 6 / 8 / 12 / 16 | 851,204 / 43,886 / 3 / 0 / 0 | 826,114 / 6,397 / 1 / 1 / 0 |
+| worst difference | 9 | 12 (one I_PCM macroblock) |
+| runtime (repair) | 185 s (139 s) | 175 s (136 s) |
+
+Amazon, full file (the drops free 501 MB of 5,898 MB of video):
+
+| | 2.1 | 2.2 |
+|---|---|---|
+| repair: bytes added | +121.9 MB (24%) | +153.1 MB (31%) |
+| output file | 5,660 MB | 5,692 MB (input: 6,040 MB) |
+| periods left over budget | 87 of 1,403 | 0 (87 repaired again) |
+| MBs off by ≥ 6 / 8 / 12 / 16 / 32 | 283,823 / 10 / 5 / 5 / 5 | 45,254 / 11 / 8 / 6 / 3 |
+| worst difference | 38 | 38 (the same I_PCM macroblock) |
+| differing outside hard-drop neighbourhoods | 0 | 0 |
+| repair workers | 6 | 9 |
+| runtime (repair, verify) | 53.5 min (42, 8) | 52.0 min (41, 8) |
+| peak private memory | | 12.7 GB |
+
+smoke.mkv, the leading B pictures of its 300 anchor rebuilds:
+
+| | 2.1 | 2.2 |
+|---|---|---|
+| bytes added | +16.8 MB | +20.5 MB (output still 131 MB smaller than the input) |
+| MBs off by ≥ 8 / 12 / 16 / 24 / 32 | 4,150 / 1,383 / 14 / 4 / 2 | 78 / 31 / 8 / 1 / 0 |
+| worst difference | 35 | 28 |
+| runtime (rebuild) | 384 s (126 s) | 388 s (131 s) |
+
+Where the time goes (the full file's repair, summed over workers): writing
+patched pictures (parsing, re-deriving motion, CABAC encoding) about 40%,
+the corrections about 25% (of which parsing original pictures is half),
+waiting for the two decoders about 25%. The caches help the clip most:
+on the full file, periods with more than 32 rewritten pictures take 61% of
+the repair time, and the merged periods of 200-400 pictures (the longest
+tasks) are longer than the caches. On the clip the repair stays far from
+CPU-bound (35-45% of the machine with 9 workers), but each worker gets
+slower as workers are added (about 35% from 6 to 9), which points at
+contention in memory allocation: a parsed picture is tens of thousands of
+small allocations.
 
 ### Version 2.1: residual corrections
 
@@ -747,8 +822,8 @@ given only the raw output stream with no `--default-duration`, infers
   corrections"). With `--no-corrections`, as in 2.0: below 16, or above it
   where the 2% per-picture PCM cap ran out.
 - A correction costs the time of reconstructing macroblocks and of more
-  repair rounds: the full Amazon file takes 54 minutes instead of 34, and
-  the repair pool is smaller (2.2 GB per worker budgeted).
+  repair rounds: the full Amazon file takes 52 minutes instead of 2.0's
+  34 (2.1: 54).
 - Hard drops in exact mode leave differences of 1-8 levels around the I_PCM
   patches. They come from deblocking across PCM edges, and from intra
   prediction and later references that read post-deblock PCM pixels.
@@ -758,8 +833,9 @@ given only the raw output stream with no `--default-duration`, infers
   them would take the tool's own deblocking filter and intra prediction.
 - An anchor rebuild changes the B pictures displayed just before the pair:
   they now read I2, a second encode of K's frame. Differences are
-  encode-noise level; corrections bring macroblocks off by 8 or more back
-  (on smoke.mkv 14 macroblocks stay at 16 or more, worst 35, in one fast-motion pair). With
+  encode-noise level; corrections and I_PCM bring macroblocks off by 8 or
+  more back (on smoke.mkv 78 macroblocks stay at 8 or more, 8 at 16 or
+  more, worst 28). With
   `--no-corrections` the 2% PCM cap leaves fast-motion pictures at up to
   about 56 levels.
 - After a rebuild, I2 is an open-GOP random-access point rather than an

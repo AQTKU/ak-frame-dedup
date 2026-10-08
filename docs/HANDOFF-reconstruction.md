@@ -5,8 +5,15 @@
 > `recon.rs` reconstructs inter MBs bit-exactly (checked with `-skip_loop_filter all` on all four
 > files); corrections use a QP ladder (QP−6k doubles levels exactly), predicted references and a
 > deblocking-aware target. Full Amazon file: MBs ≥ 8 from ~2.1M to 10, worst 103 → 38, +122 MB
-> (24% of the freed bytes). smoke.mkv's rebuilt leading B pictures: ≥ 16 from 12.8k to 27.
+> (24% of the freed bytes). smoke.mkv's rebuilt leading B pictures: ≥ 16 from 12.8k to 14.
 > The side idea (keep both twins and trim at a sync point) is still open.
+>
+> **2.2.0 (branch `pooled-budget`):** the byte budget is pooled across IDR periods (periods
+> that run out are repaired again with a share of what the others left), the rebuilt leading B
+> pictures get I_PCM from 8, and the measured repair caches parsed pictures and original frames
+> across rounds. Full Amazon file: MBs ≥ 6 from 284k to 45k, +153 MB (31%). Next for speed: the
+> repair is not CPU-bound but slows per worker as workers are added (allocation contention: try
+> mimalloc, or flatter `Coefs`), and long merged periods (200-400 pictures) outgrow the caches.
 
 This brief is for a fresh session. Read `README.md` first, especially "How it works" and "Explicit mode". `docs/HANDOFF.md` and `docs/HANDOFF-anchor-rebuild.md` are older design background; skim them only if something here is unclear.
 

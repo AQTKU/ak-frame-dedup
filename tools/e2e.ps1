@@ -7,10 +7,11 @@ $out = 'work\port\e2e'
 New-Item -ItemType Directory -Force $out | Out-Null
 $inputs = @{ sample = 'sample.mkv'; foliage = 'foliage.mkv'; smoke = 'smoke.mkv'; clip = 'work\mmco\clip.mkv'
              full = 'mmco-or-ref-list-modification.mkv' }
-# 2.1 references: sample and foliage are unchanged since 1.2.0; smoke, clip and full changed
-# with residual corrections (the 2.0 outputs are what --no-corrections gives)
+# 2.2 references: sample and foliage are unchanged since 1.2.0; smoke, clip and full changed
+# with residual corrections (2.1) and the pooled budget (2.2); the 2.0 outputs are what
+# --no-corrections gives
 $base = @{ sample = 'work\port\baseline\sample.py.mkv'; foliage = 'work\port\baseline\foliage.py.mkv'
-           smoke = 'work\v21\smoke.mkv'; clip = 'work\v21\clip.mkv'; full = 'work\v21\full.mkv' }
+           smoke = 'work\v22\final\smoke.mkv'; clip = 'work\v22\final\clip.mkv'; full = 'work\v22\final\full.mkv' }
 $workers = @{ full = 16 }
 function streamhash($f) { (ffmpeg -v error -i $f -map 0 -c copy -f streamhash -hash md5 - 2>$null) -join ';' }
 foreach ($n in $Names) {
