@@ -22,12 +22,13 @@ CROP, ZOOM, GAIN = 96, 3, 8
 
 
 def frame(path, n):
-    """Luma of display frame n (0-based) as uint8 HxW."""
+    """Luma of display frame n (0-based) as uint8 HxW: the decoded Y plane
+    (pix_fmt gray would rescale the 16-235 range)."""
     raw = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{n})", "-frames:v", "1",
-         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+         "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"],
         capture_output=True, check=True).stdout
-    return np.frombuffer(raw, np.uint8).reshape(H, W)
+    return np.frombuffer(raw, np.uint8)[:W * H].reshape(H, W)
 
 
 def save(a, p):
