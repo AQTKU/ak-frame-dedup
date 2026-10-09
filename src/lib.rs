@@ -26,4 +26,4 @@ pub mod stream;
 pub mod system;
 pub mod verify;
 
-pub const VERSION: &str = "2.1.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
