@@ -125,10 +125,6 @@ frames are as in 2.0):
 | MBs off by ≥ 8 / 12 / 16 / 24 / 32 | 276,812 / 67,477 / 12,800 / 2,163 / 960 | 4,150 / 1,383 / 14 / 4 / 2 |
 | worst difference | 56 | 35 |
 
-The review pages under `review/` (served by `.claude/launch.json`) show
-96x96 crops of the worst macroblocks of each version: original, both
-outputs, and their differences ×8.
-
 ## Earlier results (1.x / 2.0)
 
 Measured on the four test files on a 32-thread / 31.7 GB machine with

@@ -5,8 +5,8 @@
 *.npy
 *.pkl
 work/
-review/**/*.png
-review/**/cases.json
+review/
+.claude/
 __pycache__/
 *.pyc
 
