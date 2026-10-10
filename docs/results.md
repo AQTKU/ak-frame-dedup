@@ -10,6 +10,7 @@ E here:
 | sample C | 44 minutes, 29.97 fps from 23.976. The encoder's IDR, every 90 frames, often lands on the later twin of a duplicate, so it exercises the anchor rebuild. |
 | sample D | 22 minutes of native 29.97 content with no duplicates: the tool must refuse it. |
 | sample E | 84 minutes, an x264 encode with B-pyramid, MMCO, reference list modification and weighted prediction (explicit mode). The *sample E clip* is a 5-minute excerpt of it. |
+| sample F | 45 minutes, mixed content: shots at native 29.97 between 23.976 ones (detected as 24 fps, 153 phase changes). The encoder starts every shot with an I picture and uses two forward references. |
 
 Samples A-C are plain (exact mode) encodes; sample E needs explicit mode.
 
@@ -21,7 +22,33 @@ residual corrections (see "Residual corrections" in [how-it-works.md](how-it-wor
 2.0's output. 2.2 pools the byte budget across IDR periods, repairs the
 rebuilt leading B pictures from 8 levels, and makes the measured repair
 faster; 2.2.1 uses the mimalloc allocator (same output, the full sample E
-file in 41 minutes instead of 52).
+file in 41 minutes instead of 52). 2.2.2 never predicts a duplicate on the
+first frame after a cut and refuses hard drops that would leave a reference
+list short (output identical on samples A-C and E).
+
+## Version 2.2.2: mixed-rate content
+
+Sample F made 2.2.1 fail with `list index out of range`. In its native 29.97
+shots the cadence phase is arbitrary, and 97 predicted duplicates fell on the
+first frame of a shot, i.e. on the encoder's scene-cut I picture: 77 of the
+96 hard pairs were such P + I pairs, and one IDR + I pair left the next P
+with one reference where its header makes two active. Results with default
+settings and `--verify`:
+
+| | 2.2.1 | 2.2.1 `--force-explicit` | 2.2.2 |
+|---|---|---|---|
+| status | error | ok | ok |
+| hard pairs | 96 | 96 | 21 |
+| output size (input 2.02 GB) | | 2.78 GB | 1.89 GB |
+| repair | (1.08 M PCM MBs before the error) | 2.15 M PCM MBs | 25,195 PCM MBs, +9.7 MB |
+| max A/V offset | 52.3 ms | | 52.3 ms |
+| runtime | | 13.2 min | 5.0 min |
+
+Verify finds no differences outside the hard-drop neighbourhoods and rebuilt
+leading B pictures. With only the reference-list check (the cut rule turned
+off) the IDR + I pair is kept instead of failing, but the repair adds 787 MB.
+Samples A, B, C, the sample E clip and the full sample E file are identical
+per stream to 2.2.1.
 
 
 ## Version 2.2: pooled budget, faster repair

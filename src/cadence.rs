@@ -287,15 +287,36 @@ pub fn detect_with(e: &[f64], segments: &[Segment], in_rate: Ratio, pen_black: f
     out
 }
 
+/// The duplicates of a candidate: each segment's phase mask, except the first
+/// frame after a hard cut ([`cut_repeats`]), which cannot repeat the
+/// previous shot.
 pub fn predicted_dups(n: usize, segments: &[Segment], cand: &Candidate) -> Vec<bool> {
     let mut dup = vec![false; n];
     for (s, &m) in segments.iter().zip(&cand.phases) {
         dup[s.start..s.end].copy_from_slice(&dup_mask(s.start, s.end, cand.p, cand.q, m));
+        if s.kind == SegKind::Cut {
+            dup[s.start] = false;
+        }
     }
     if n > 0 {
         dup[0] = false;
     }
     dup
+}
+
+/// First frames after a hard cut that a candidate's phase mask marks as
+/// duplicates; [`predicted_dups`] leaves them out. In native 29.97 shots the
+/// phase is arbitrary and often lands there, and with encoders that start
+/// each shot with an I picture such a pair is two reference pictures that no
+/// drop handles cheaply. The frame count changes at each of them, so the A/V
+/// sync correction treats them as events.
+pub fn cut_repeats(segments: &[Segment], cand: &Candidate) -> Vec<usize> {
+    segments
+        .iter()
+        .zip(&cand.phases)
+        .filter(|(s, m)| s.kind == SegKind::Cut && s.start > 0 && dup_mask(s.start, s.start + 1, cand.p, cand.q, **m)[0])
+        .map(|(s, _)| s.start)
+        .collect()
 }
 
 /// Mean evidence of the predicted duplicates minus what a random phase would
@@ -392,6 +413,8 @@ pub struct Analysis {
     pub candidates: Vec<Candidate>,
     /// Predicted duplicates of the best candidate.
     pub dup: Vec<bool>,
+    /// The best candidate's [`cut_repeats`].
+    pub cut_repeats: Vec<usize>,
     pub score: f64,
     pub n_evidence: usize,
     pub detection: DetectionReport,
@@ -418,6 +441,7 @@ pub fn analyse(feat: &Features, fps_in: Ratio, model: &Model, trained_on: Option
         bail!("no candidate source rate fits an input rate of {fps_in}");
     }
     let dup = predicted_dups(n, &segs, &cands[0]);
+    let cut_repeats = cut_repeats(&segs, &cands[0]);
     let (score, n_ev) = cadence_score(&e, &static_, &dup);
     let mut det = DetectionReport {
         model: trained_on.map(str::to_string),
@@ -451,6 +475,7 @@ pub fn analyse(feat: &Features, fps_in: Ratio, model: &Model, trained_on: Option
         segments: segs,
         candidates: cands,
         dup,
+        cut_repeats,
         score,
         n_evidence: n_ev,
         detection: det,
@@ -557,6 +582,32 @@ mod tests {
         assert!(Ratio::new(1, 2) < r && r < Ratio::int(1));
         assert_eq!(Ratio::new(25, 1).div(Ratio::new(30000, 1001)), Ratio::new(1001, 1200));
         assert_eq!(rate_name(Ratio::new(60, 2), &input_rates()), Some("30"));
+    }
+
+    /// A phase whose duplicate falls on the first frame after a hard cut: that
+    /// frame is not a duplicate (it cannot repeat the previous shot) and is
+    /// reported in `cut_repeats`; the rest of the pattern stays.
+    #[test]
+    fn no_duplicate_on_a_cut() {
+        // r = 4/5, phase 4: frame n is a duplicate iff ((n - 1) * 4 + 4) % 5 == 0
+        let segs = [
+            Segment { start: 0, end: 10, kind: SegKind::Start },
+            Segment { start: 10, end: 20, kind: SegKind::Cut },
+        ];
+        let cand = Candidate {
+            source: "24",
+            rate: Ratio::int(24),
+            r: Ratio::new(4, 5),
+            p: 4,
+            q: 5,
+            total: 0.0,
+            phases: vec![4, 4],
+            segment_scores: vec![0.0, 0.0],
+        };
+        let dup = predicted_dups(20, &segs, &cand);
+        let at: Vec<usize> = (0..20).filter(|&i| dup[i]).collect();
+        assert_eq!(at, vec![5, 15]);
+        assert_eq!(cut_repeats(&segs, &cand), vec![10]);
     }
 
     #[test]

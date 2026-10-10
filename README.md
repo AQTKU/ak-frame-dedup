@@ -115,8 +115,9 @@ Advanced options, for tuning the repair and debugging:
   slices per picture. The tool exits with code 3 on these rather than guess.
 
 It assumes the whole video has one source rate. A short intro made natively at
-29.97 (like a studio logo) is pushed through the same pattern and may result
-in real dropped motion. The output is constant frame rate video.
+29.97 (like a studio logo), or shots filmed at 29.97 in otherwise 23.976
+content, are pushed through the same pattern and lose one real frame in five
+there. The output is constant frame rate video.
 
 ## Building
 

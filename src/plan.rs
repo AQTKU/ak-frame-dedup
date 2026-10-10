@@ -17,6 +17,9 @@
 //!     with the least motion is dropped instead (a visible substitute: one
 //!     real frame is lost, but A/V sync holds); only if there is none is the
 //!     pair kept ("unsupported") and the count corrected at the next sync point.
+//!     A hard drop that would leave a later picture's reference list shorter
+//!     than its slice header expects (`hard_ok`) is not possible either: that
+//!     pair is kept too.
 //!
 //! A/V sync: kept frame n becomes output frame k, shown at k / fps_out where
 //! it was shown at n / fps_in. Its offset in output frames is k - n * r.
@@ -114,6 +117,8 @@ pub struct RebuildFallback {
 /// ids) or None, the reason it is not possible).
 pub type RebuildableFn<'a> = dyn Fn(usize, usize) -> (Option<Vec<usize>>, Option<String>) + 'a;
 /// `free(dec)`: dropping a reference picture leaves all other reference lists unchanged.
+/// Also the type of `hard_ok(dec)`: a hard drop of reference picture `dec`
+/// leaves no reference list shorter than in the original.
 pub type FreeFn<'a> = dyn Fn(usize) -> bool + 'a;
 
 /// What `choose_drops` returns (Python: a 6-tuple, with the rebuild entries
@@ -164,6 +169,7 @@ pub fn choose_drops(
     visible_subs: bool,
     rebuildable: Option<&RebuildableFn>,
     explicit: bool,
+    hard_ok: Option<&FreeFn>,
 ) -> Choice {
     let n_pics = disp.len();
     let mut c = Choice::default();
@@ -292,6 +298,12 @@ pub fn choose_drops(
             if let Some(s) = s {
                 c.drop.insert(s);
                 c.subs.push(Substitute { pair: n, display: s, visible: false, mad: np::round(mad_bmax.unwrap().0[s], 3), types });
+            } else if !b.idr && !hard_ok.map_or(true, |f| f(b.dec)) {
+                c.unsupported.push(Unsupported {
+                    display: n,
+                    reason: "dropping the later twin would leave a reference list short".to_string(),
+                    types,
+                });
             } else if !b.idr {
                 c.drop.insert(n);
                 c.hard.push(Hard { kept_display: n - 1, dropped_display: n, kept_dec: a.dec, dropped_dec: b.dec, types });
@@ -667,9 +679,14 @@ pub struct PlanInputs<'a> {
     pub visible_subs: bool,
     pub rebuildable: Option<&'a RebuildableFn<'a>>,
     pub explicit: bool,
+    /// Old path: `hard_ok(dec)` (see [`FreeFn`]); a pair that fails it is kept.
+    pub hard_ok: Option<&'a FreeFn<'a>>,
     pub black: &'a [(usize, usize)],
     /// First frames of new shots.
     pub cuts: &'a [usize],
+    /// Cuts where the cadence's duplicate was left out
+    /// ([`crate::cadence::cut_repeats`]): the frame count steps there.
+    pub cut_repeats: &'a [usize],
     pub r: Ratio,
     pub fps_out: Ratio,
     pub cadence: &'a CadenceReport,
@@ -693,11 +710,12 @@ pub struct PlanOutput {
 /// drops, correct the A/V sync, and build the report sections.
 pub fn run_plan(inp: &PlanInputs) -> PlanOutput {
     let n = inp.disp.len();
-    let ch = choose_drops(inp.disp, inp.dup, inp.free, Some((inp.mad, inp.bmax)), inp.visible_subs, inp.rebuildable, inp.explicit);
+    let ch = choose_drops(inp.disp, inp.dup, inp.free, Some((inp.mad, inp.bmax)), inp.visible_subs, inp.rebuildable, inp.explicit, inp.hard_ok);
     let n_planned = ch.drop.len();
     let n_nonref = n_planned as i64 - ch.hard.len() as i64 - ch.freed.len() as i64 - ch.subs.len() as i64 - ch.rebuilds.len() as i64;
     let mut events: Vec<usize> = inp.cadence.phase_changes.iter().filter(|c| c.at == "cut").map(|c| c.display).collect();
     events.extend(ch.unsupported.iter().map(|u| u.display));
+    events.extend(inp.cut_repeats.iter().copied());
     let mut twins = BTreeSet::new();
     for n in (1..inp.dup.len()).filter(|&i| inp.dup[i]) {
         twins.insert(n - 1);
@@ -926,8 +944,10 @@ pub fn dev_plan(args: &[String]) -> Result<()> {
         visible_subs: inp.visible_subs,
         rebuildable: if rb_tab.is_some() { Some(&rebuildable) } else { None },
         explicit: inp.explicit,
+        hard_ok: None,
         black: &inp.black,
         cuts: &inp.cuts,
+        cut_repeats: &[],
         r,
         fps_out: Ratio::new(inp.fps_out.0, inp.fps_out.1),
         cadence: &cadence,

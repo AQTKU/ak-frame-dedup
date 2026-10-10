@@ -39,6 +39,13 @@ named here are under `src/`.
    - For each candidate ratio, dynamic programming chooses the segment
      phases. Continuing the phase is free; changing it costs 25 nats at a
      black run and 150 nats at a hard cut.
+   - The first frame after a hard cut is never a duplicate, whatever the
+     phase says: it cannot repeat the previous shot. In shots made natively
+     at 29.97 the phase is arbitrary and would often land there, and an
+     encoder that starts every shot with an I picture then turns the pair
+     into two reference pictures (a hard drop that needs most of the next
+     GOP repaired). The frame count steps at each such cut, so the A/V sync
+     (step 7) treats it like a phase change.
    - The best total picks **one global source rate**. The candidates are:
 
      | source → input | ratio | cadence |
@@ -76,7 +83,11 @@ named here are under `src/`.
       or static: proxy MAD < 0.25 and block max < 1.0). This is an
       *invisible substitute*;
    5. otherwise drop the later twin as a **hard drop**, repaired in step 9,
-      unless it is an IDR (an IDR is never dropped);
+      unless it is an IDR (an IDR is never dropped), or unless dropping it
+      would leave a later picture's reference list shorter than its slice
+      header makes active (e.g. an IDR, its I twin, then a P reading both:
+      without the twin only one reference is left). Such a pair is kept as
+      in rule 8. The whole plan is checked the same way before writing;
    6. if the later twin D is an IDR, drop the earlier twin K by an **anchor
       rebuild** (step 10): D is demoted to a non-IDR I picture that takes
       K's place. This needs, header-only, K to be a non-IDR reference
@@ -97,8 +108,9 @@ named here are under `src/`.
    - Kept frame n becomes output frame k at k/fps_out; its offset is
      k − n·r output frames.
    - Inside a stretch of constant phase the offset cycles around a constant
-     mean. Phase changes at hard cuts and unsupported pairs move that mean
-     (phase changes at black runs are corrected inside the run).
+     mean. Phase changes at hard cuts, duplicates left out at a cut (step 4)
+     and unsupported pairs move that mean (phase changes at black runs are
+     corrected inside the run).
    - The mean is pulled back within ±0.5 frame at the first **sync point**
      after it moves, where one frame more or less goes unseen:
      - a **black run**: one extra black frame is dropped (a non-reference
@@ -494,8 +506,11 @@ ffmpeg decoders once crashed a machine with marginal RAM.
   lasts until the next sync point where a cheap picture is available (a
   black run, a static frame, or a cut with a non-reference picture next to
   it). The offsets are reported.
-- Native-rate intros (logos) are forced through the content cadence, which
-  can drop real frames there. This is by design: the output is always CFR.
+- Native-rate intros (logos) and native 29.97 shots in mixed-rate content
+  are forced through the content cadence, one frame in five at a fixed
+  phase per segment, which drops real frames there. This is by design: the
+  output is always CFR, and a regular pattern judders less than picking
+  frames freely.
 - The likelihood tables were trained on one file from this encoder. Other
   encoders may need retraining with `frame-dedup dev train-model` on a labelled
   file.

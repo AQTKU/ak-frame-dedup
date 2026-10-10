@@ -1094,6 +1094,37 @@ mod tests {
         Picture { slices: vec![sl], idr, ref_idc, ..Default::default() }
     }
 
+    /// An IDR K, its I twin D and a P reading [D, K]: without D the P's list
+    /// is [K] while its header still makes two references active. With an
+    /// older reference in the DPB the list only shifts ([K, older]).
+    #[test]
+    fn short_lists_after_a_hard_drop() {
+        use crate::stream::{hard_drop_checker, short_lists};
+        use std::collections::HashSet;
+        let spss = sps(4);
+        let mut pics = vec![
+            pic(true, 3, SliceType::I, 0, 0, 0, vec![]),
+            pic(false, 2, SliceType::I, 1, 2, 0, vec![]),
+            pic(false, 2, SliceType::P, 2, 8, 2, vec![]),
+        ];
+        dpb_walk(&spss, &mut pics).unwrap();
+        assert_eq!(pics[2].lists[0], vec![1, 0]);
+        assert_eq!(short_lists(&spss, &pics, &HashSet::from([1])).unwrap(), vec![2]);
+        assert!(!hard_drop_checker(&spss, &pics)(1).unwrap());
+
+        let mut pics = vec![
+            pic(true, 3, SliceType::I, 0, 0, 0, vec![]),
+            pic(false, 2, SliceType::P, 1, 2, 1, vec![]),
+            pic(false, 2, SliceType::P, 2, 4, 2, vec![]),
+            pic(false, 2, SliceType::P, 3, 6, 2, vec![]),
+            pic(false, 2, SliceType::P, 4, 8, 2, vec![]),
+        ];
+        dpb_walk(&spss, &mut pics).unwrap();
+        assert_eq!(pics[4].lists[0], vec![3, 2]);
+        assert!(short_lists(&spss, &pics, &HashSet::from([3])).unwrap().is_empty());
+        assert!(hard_drop_checker(&spss, &pics)(3).unwrap());
+    }
+
     #[test]
     fn dpb_walk_sliding_window_and_pocs() {
         let spss = sps(2);

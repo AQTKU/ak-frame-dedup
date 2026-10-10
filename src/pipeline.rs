@@ -360,6 +360,8 @@ struct Loaded {
     black: Vec<(usize, usize)>,
     cuts: Vec<usize>,
     dup: Vec<bool>,
+    /// See [`cadence::cut_repeats`].
+    cut_repeats: Vec<usize>,
     cadence: CadenceReport,
 }
 
@@ -551,7 +553,7 @@ impl Run {
             an.dup.iter().filter(|&&d| d).count()
         ));
         self.rep.cadence = Some(cad.clone());
-        Ok(Loaded { es, spss, ppss, pics, explicit, fps_in, feat, fps_out, r, black: an.black.clone(), cuts: an.cuts.clone(), dup: an.dup.clone(), cadence: cad })
+        Ok(Loaded { es, spss, ppss, pics, explicit, fps_in, feat, fps_out, r, black: an.black.clone(), cuts: an.cuts.clone(), dup: an.dup.clone(), cut_repeats: an.cut_repeats.clone(), cadence: cad })
     }
 
     // ------------------------------------------------------------------
@@ -597,6 +599,24 @@ impl Run {
                 }
             }
         };
+        // old path: a hard drop must not shorten a later picture's reference
+        // list, alone (`hard_ok`) or together with the other drops of its
+        // period (checked on the whole plan below; the hard drops of a
+        // failing period are then kept and the plan is made again)
+        let hard_old = stream::hard_drop_checker(&ld.spss, pics);
+        let kept_hard: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+        let hard_ok = |d: usize| -> bool {
+            if kept_hard.borrow().contains(&d) {
+                return false;
+            }
+            match hard_old(d) {
+                Ok(b) => b,
+                Err(e) => {
+                    err.borrow_mut().get_or_insert(e);
+                    false
+                }
+            }
+        };
         let inp = PlanInputs {
             disp: &disp,
             dup: &ld.dup,
@@ -606,16 +626,39 @@ impl Run {
             visible_subs: !self.a.keep_idr_pairs,
             rebuildable: if self.a.no_rebuild { None } else { Some(&rebuildable) },
             explicit: ld.explicit,
+            hard_ok: if ld.explicit { None } else { Some(&hard_ok) },
             black: &ld.black,
             cuts: &ld.cuts,
+            cut_repeats: &ld.cut_repeats,
             r: ld.r,
             fps_out: ld.fps_out,
             cadence: &ld.cadence,
         };
-        let out = plan::run_plan(&inp);
-        if let Some(e) = err.into_inner() {
-            return Err(e);
-        }
+        let out = loop {
+            let out = plan::run_plan(&inp);
+            if let Some(e) = err.borrow_mut().take() {
+                return Err(e);
+            }
+            if ld.explicit {
+                break out;
+            }
+            // the first-stage drop set, as `write` removes it
+            let disp_dec = display_to_dec(pics);
+            let rb_k: HashSet<usize> = out.rebuilds.iter().map(|r| r.k_dec).collect();
+            let drop_dec: HashSet<usize> = out.drop.iter().map(|&i| disp_dec[i]).filter(|d| !rb_k.contains(d)).collect();
+            let short = stream::short_lists(&ld.spss, pics, &drop_dec)?;
+            if short.is_empty() {
+                break out;
+            }
+            let bad_periods: HashSet<usize> = short.iter().map(|&d| pics[d].period).collect();
+            let more: Vec<usize> =
+                out.hard.iter().map(|h| h.dropped_dec).filter(|&d| bad_periods.contains(&pics[d].period)).collect();
+            if more.is_empty() {
+                bail!("dropping would leave the reference lists of pictures {:?} short", &short[..short.len().min(5)]);
+            }
+            self.log(&format!("  {} hard drops together leave reference lists short; keeping those pairs", more.len()));
+            kept_hard.borrow_mut().extend(more);
+        };
         let rep = out.report;
         for f in &rep.anchor_rebuild_fallbacks {
             self.log(&format!(

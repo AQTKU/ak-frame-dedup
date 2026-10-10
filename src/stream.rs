@@ -440,6 +440,44 @@ pub fn free_drop_checker<'a>(spss: &'a Spss, pics: &'a [Picture]) -> impl Fn(usi
     }
 }
 
+/// Kept pictures whose default reference list gets shorter when `drop` is
+/// removed (renumbered as in [`write_stream`]): an index that was valid in
+/// the original would name no picture. E.g. an IDR K, its I twin D and a P
+/// reading [D, K]: without D the P's list is [K], but its slice header still
+/// makes two references active. Only periods that lose a reference picture
+/// are walked.
+pub fn short_lists(spss: &Spss, pics: &[Picture], drop: &HashSet<usize>) -> Result<Vec<usize>> {
+    let mut out = Vec::new();
+    for r in period_ranges(pics) {
+        out.extend(short_in_period(spss, &pics[r], drop)?);
+    }
+    Ok(out)
+}
+
+/// [`short_lists`] for the pictures of one IDR period.
+fn short_in_period(spss: &Spss, per: &[Picture], drop: &HashSet<usize>) -> Result<Vec<usize>> {
+    if !per.iter().any(|p| p.ref_idc != 0 && drop.contains(&p.dec)) {
+        return Ok(Vec::new());
+    }
+    let nl = new_lists(spss, per, drop)?;
+    Ok(per
+        .iter()
+        .filter(|q| !drop.contains(&q.dec) && (0..2).any(|l| nl[&q.dec][l].len() < q.lists[l].len()))
+        .map(|q| q.dec)
+        .collect())
+}
+
+/// Returns `ok(dec)`: dropping reference picture `dec` alone leaves every
+/// reference list of its IDR period at its original length (see
+/// [`short_lists`]); a hard drop that fails this cannot be repaired.
+pub fn hard_drop_checker<'a>(spss: &'a Spss, pics: &'a [Picture]) -> impl Fn(usize) -> Result<bool> + Sync + 'a {
+    let periods = period_ranges(pics);
+    move |dec| {
+        let per = &pics[periods[pics[dec].period].clone()];
+        Ok(short_in_period(spss, per, &HashSet::from([dec]))?.is_empty())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // dev commands: `headers`, `escape`, `patch-sps` (oracle: port/oracle.py)
 // ---------------------------------------------------------------------------
