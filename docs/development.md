@@ -35,6 +35,15 @@ tooling were removed in 2.0.0; they remain in git history (commit
 `tools/e2e.ps1` runs the release build on the test files and compares
 per-stream MD5s with reference outputs.
 
+`tools/mb_review.py <input.mkv>` runs the release build with `--verify
+--mb-report --mb-threshold 3` and writes `review/<name>-mb3/index.html`: the
+worst differing frames (default 150), each with the original and output
+switchable or flickering, a difference overlay, the listed macroblocks
+outlined, and lossless 4x crops of its worst blocks. `--mb-json mb.json
+--output out.mkv` reuses an earlier run; `--threshold` and `--max-frames`
+adjust it. Needs Python with numpy and Pillow.
+`python -m http.server --directory review` serves the pages.
+
 ## Dev tools
 
 `frame-dedup dev <command>`:
